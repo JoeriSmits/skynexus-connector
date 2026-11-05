@@ -19,6 +19,7 @@
     "shortDescription": "Streams your simulator aircraft to your SkyNexus map",
     "longDescription": "An optional tray app that reads your own aircraft and nearby traffic from MSFS or X-Plane on this computer and streams it to your SkyNexus enroute map. Outbound connections only; nothing is installed in the simulator. It can start and stop with MSFS through its own entry in MSFS's add-on list (exe.xml), which uninstalling removes.",
     "copyright": "SkyNexus",
+    "licenseFile": "windows/installer-notice.txt",
     "createUpdaterArtifacts": false,
     "icon": [
       "icons/32x32.png",

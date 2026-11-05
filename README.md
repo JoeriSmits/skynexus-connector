@@ -2,7 +2,7 @@
 
 An optional tray app for [SkyNexus](https://skynexus.nl), the EFB for flight-sim pilots. It reads your own aircraft (and the traffic the sim knows around you) from MSFS 2020/2024 or X-Plane 11/12 on this computer and streams it, about once a second, to your own SkyNexus enroute map. Without it, the map keeps matching you on the VATSIM feed as before.
 
-**Download:** the latest installer is on the [Releases](https://github.com/JoeriSmits/skynexus-connector/releases/latest) page (Windows `-setup.exe`, per-user, no admin rights; macOS `.dmg` for X-Plane). Installed copies update themselves.
+**Download:** the latest installer is on the [Releases](https://github.com/JoeriSmits/skynexus-connector/releases/latest) page (Windows `-setup.exe`, per-user, no admin rights; macOS `.dmg` for X-Plane). Installed copies update themselves. [Privacy](PRIVACY.md) · [Code signing policy](CODE_SIGNING_POLICY.md)
 
 Tauri 2, Rust core, tray only (no window). Windows first; the macOS build covers X-Plane. MIT licensed.
 

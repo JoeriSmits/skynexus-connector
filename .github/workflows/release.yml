@@ -131,6 +131,8 @@ jobs:
                 "- macOS (X-Plane): download the `.dmg`.",
                 "",
                 "Installed copies update themselves from this release once it is published.",
+                "",
+                `[Privacy](https://github.com/${owner}/${repo}/blob/main/PRIVACY.md) · [Code signing policy](https://github.com/${owner}/${repo}/blob/main/CODE_SIGNING_POLICY.md)`,
               ].join("\n"),
               draft: true,
               prerelease: false,

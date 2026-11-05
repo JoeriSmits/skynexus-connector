@@ -1,0 +1,56 @@
+SKYNEXUS CONNECTOR: WHAT THIS INSTALLS AND SENDS
+
+Please read this before you continue.
+
+WHAT IT SENDS
+After you pair it with your SkyNexus account, the connector sends your own
+simulator aircraft (position, altitude, speed, heading, callsign) and the
+traffic the sim knows within 80 km to your own SkyNexus map, about once a
+second while a flight is loaded. Pairing sends your computer's name. The
+relay passes the data to your own map only and stores nothing. It also asks
+GitHub for updates every 6 hours. No analytics, no telemetry.
+Privacy statement: https://github.com/JoeriSmits/skynexus-connector/blob/main/PRIVACY.md
+
+WHAT IT CHANGES ON THIS COMPUTER
+- It installs into your user profile (no administrator rights).
+- "Start with MSFS" (on by default): it adds one entry named
+  "SkyNexus Connector" to the add-on list (exe.xml) of each Microsoft Flight
+  Simulator 2020/2024 install it finds, so MSFS starts it, and it quits when
+  MSFS closes. Nothing else in that file is changed, and the previous file is
+  kept as exe.xml.skynexus-backup. Switch it off with "Start with MSFS" in
+  the tray menu.
+- It keeps its sign-in in Windows Credential Manager and writes logs to
+  %LOCALAPPDATA%\nl.skynexus.connector\logs.
+- Uninstalling removes the app and the exe.xml entry.
+
+HOW TO STOP IT
+Quit or Sign out from the tray icon, or uninstall it from Windows Settings.
+
+Code signing policy: https://github.com/JoeriSmits/skynexus-connector/blob/main/CODE_SIGNING_POLICY.md
+
+------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2026 SkyNexus
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+SimConnect.dll, included in this installer, is Microsoft's and is distributed
+under the Microsoft Flight Simulator SDK EULA, not under the MIT License.

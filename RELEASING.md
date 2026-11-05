@@ -20,11 +20,9 @@ npm run tauri signer generate -- -w ~/.tauri/skynexus-connector.key
 
 ### 2. SimConnect.dll (Windows build)
 
-Take it from the MSFS SDK (`MSFS SDK/SimConnect SDK/lib/SimConnect.dll`). It is not in this repository. The MSFS 2024 SDK's DLL is 58 368 bytes, about 78 KB in base64, over GitHub's 48 KB secret limit, so:
+Nothing to set: it is committed in `src-tauri/vendor/` (MSFS SDK 0.16.0.0; origin, hash and licence in `src-tauri/vendor/README.md`), and the workflow checks it against the SHA-256 pinned in `release.yml` before it builds. To update it, replace the file and change the hash in both places.
 
-- upload it somewhere private (for example R2 with a long-lived signed URL), set secret `SIMCONNECT_DLL_URL`, and variable `SIMCONNECT_DLL_SHA256` = `shasum -a 256 SimConnect.dll`.
-
-(`SIMCONNECT_DLL_BASE64` is also supported, for a DLL that fits.) The workflow checks the download is a Windows DLL with that hash, and stops with a clear error when neither is set.
+If it ever has to leave the repository (Microsoft objects to redistribution), delete it and set a private download URL instead: secret `SIMCONNECT_DLL_URL` plus variable `SIMCONNECT_DLL_SHA256`. The DLL is about 78 KB in base64, over GitHub's 48 KB secret limit, so the `SIMCONNECT_DLL_BASE64` option does not fit it.
 
 ### 3. Code signing (optional, recommended)
 

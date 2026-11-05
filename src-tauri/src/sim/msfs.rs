@@ -149,9 +149,10 @@ fn load_simconnect() -> Result<Library, ConnectError> {
     if !path.is_file() {
         return Err(ConnectError::MissingDll(path));
     }
-    // TODO: verify the Authenticode signature (Microsoft) with WinVerifyTrust
-    // before loading. Deferred: it needs the windows-sys WinTrust bindings and
-    // a signer check, and the per-user install folder is writable only by the
+    // Not verified before loading. The SDK's DLL carries no Authenticode
+    // signature (MSFS SDK 0.16: checked), so a WinVerifyTrust check cannot
+    // work; a check would have to pin its SHA-256 (src-tauri/vendor/README.md)
+    // instead. Deferred: the per-user install folder is writable only by the
     // same user who could already replace the exe itself, so it adds little
     // until the app installs per machine.
     //

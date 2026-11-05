@@ -1,5 +1,7 @@
 node_modules/
 src-tauri/target/
 src-tauri/gen/
-src-tauri/vendor/
+src-tauri/vendor/*
+!src-tauri/vendor/SimConnect.dll
+!src-tauri/vendor/README.md
 src-tauri/tauri.release.conf.json

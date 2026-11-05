@@ -175,11 +175,13 @@ jobs:
             exit 1
           fi
 
-      - name: Fetch SimConnect.dll
-        # Not in the repo (MSFS SDK licence question). Option A: the DLL as a
-        # base64 secret (secrets hold at most 48 KB). Option B: a private
-        # download URL as a secret plus its SHA-256 as a variable.
+      - name: SimConnect.dll
+        # Committed in src-tauri/vendor (see its README) and checked against
+        # COMMITTED_SHA256. Without it, the old options still work: the DLL as
+        # a base64 secret (at most 48 KB), or a private download URL as a
+        # secret plus its SHA-256 as a variable.
         env:
+          COMMITTED_SHA256: 677fd3849d54e2a6831dc1aa348d974ead2255ec609fbf5830ef32bf0804b8bc
           SIMCONNECT_DLL_BASE64: ${{ secrets.SIMCONNECT_DLL_BASE64 }}
           SIMCONNECT_DLL_URL: ${{ secrets.SIMCONNECT_DLL_URL }}
           SIMCONNECT_DLL_SHA256: ${{ vars.SIMCONNECT_DLL_SHA256 }}
@@ -187,7 +189,10 @@ jobs:
           set -euo pipefail
           dest=src-tauri/vendor/SimConnect.dll
           mkdir -p "$(dirname "$dest")"
-          if [ -n "$SIMCONNECT_DLL_BASE64" ]; then
+          if [ -f "$dest" ]; then
+            SIMCONNECT_DLL_SHA256="$COMMITTED_SHA256"
+            echo "SimConnect.dll from the repository"
+          elif [ -n "$SIMCONNECT_DLL_BASE64" ]; then
             printf '%s' "$SIMCONNECT_DLL_BASE64" | tr -d '\r\n ' | base64 -d > "$dest"
             echo "SimConnect.dll from secret SIMCONNECT_DLL_BASE64"
           elif [ -n "$SIMCONNECT_DLL_URL" ]; then

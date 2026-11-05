@@ -8,4 +8,4 @@ What the connector holds and does, so you know what matters:
 - It reads your own simulator (SimConnect for MSFS, the local X-Plane web API or UDP) and never writes to it.
 - It opens no listening port. Its only connections are outbound: the SkyNexus web app (pairing and tickets) and the relay, over TLS.
 - On Windows it keeps one entry in MSFS's `exe.xml` ("Start with MSFS"), and never touches the rest of that file.
-- `SimConnect.dll` is loaded only from the folder of the running exe, by absolute path.
+- `SimConnect.dll` is loaded only from the folder of the running exe, by absolute path. The copy in `src-tauri/vendor/` is the MSFS SDK's, pinned by SHA-256 in the release workflow.

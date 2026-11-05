@@ -1,0 +1,56 @@
+[package]
+name = "skynexus-connector"
+version = "0.1.0"
+description = "SkyNexus Connector: streams your own simulator aircraft and its traffic to your SkyNexus map"
+authors = ["SkyNexus"]
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[lib]
+name = "skynexus_connector"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "skynexus-connector"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-updater = { version = "2", default-features = false, features = ["native-tls", "system-proxy", "zip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls", "blocking", "query"] }
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+tungstenite = "0.28"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+keyring = "4"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+open = "5"
+gethostname = "1"
+base64 = "0.22"
+thiserror = "2"
+url = "2"
+rand = "0.9"
+
+[target.'cfg(windows)'.dependencies]
+libloading = "0.9"
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal", "test-util"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

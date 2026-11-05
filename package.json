@@ -1,0 +1,19 @@
+{
+  "name": "skynexus-connector",
+  "private": true,
+  "version": "0.1.0",
+  "description": "SkyNexus Connector: streams your own simulator aircraft and its traffic to your SkyNexus map.",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "build:app": "tauri build --bundles app",
+    "replay": "cargo run --manifest-path src-tauri/Cargo.toml -- --headless --offline --replay src-tauri/fixtures/eddf-departure.json",
+    "test": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "lint": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
+    "test:release": "node --test scripts/release-config.test.mjs"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.4"
+  }
+}

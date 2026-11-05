@@ -1,0 +1,387 @@
+name: release
+
+# Builds and publishes the SkyNexus Connector.
+#
+# Runs only on a `v*` tag or by hand, never on pull requests or branch
+# pushes. Every job runs on GitHub-hosted runners: a self-hosted runner on a
+# public repository could run code from a fork's pull request. macOS builds
+# after Windows so the two never write latest.json at the same time.
+#
+# Third-party actions are pinned to commit SHAs (the version is in a comment);
+# bump them on purpose, never by a moving tag.
+#
+# A tag builds both and uploads the installers, the updater signatures and a
+# merged latest.json to a DRAFT GitHub Release. Publishing the draft is the
+# release switch: the updater's /releases/latest/ never sees drafts.
+# A manual run without "release" only builds and keeps the files as workflow
+# artifacts, a dry run for signing.
+#
+# Secrets and variables (RELEASING.md has the checklist):
+#   required  secrets.TAURI_SIGNING_PRIVATE_KEY (+ _PASSWORD if the key has one)
+#             vars.TAURI_UPDATER_PUBKEY (or the key itself in tauri.conf.json)
+#             SimConnect.dll: secrets.SIMCONNECT_DLL_BASE64, or
+#                             secrets.SIMCONNECT_DLL_URL + vars.SIMCONNECT_DLL_SHA256
+#   optional  Windows OV certificate: secrets.WINDOWS_CERTIFICATE (base64 PFX),
+#               secrets.WINDOWS_CERTIFICATE_PASSWORD
+#             Azure Artifact Signing: secrets.AZURE_CLIENT_ID, AZURE_CLIENT_SECRET,
+#               AZURE_TENANT_ID, vars.AZURE_SIGNING_ENDPOINT, AZURE_SIGNING_ACCOUNT,
+#               AZURE_CERT_PROFILE
+#             macOS: secrets.APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD,
+#               APPLE_SIGNING_IDENTITY; notarization adds APPLE_ID, APPLE_PASSWORD
+#               (app-specific), APPLE_TEAM_ID
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Upload to a draft release for the tag below (otherwise workflow artifacts only)"
+        type: boolean
+        default: false
+      tag:
+        description: "Existing vX.Y.Z tag for the draft release (only with release)"
+        type: string
+        default: ""
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Version and draft release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      release_id: ${{ steps.release.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the tag
+        id: tag
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          WANT_RELEASE: ${{ inputs.release }}
+          INPUT_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "push" ]; then
+            tag="$REF_NAME"
+          elif [ "$WANT_RELEASE" = "true" ]; then
+            tag="$INPUT_TAG"
+            if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::A release run needs the tag input: an existing vX.Y.Z tag."
+              exit 1
+            fi
+            git fetch --depth=1 origin "refs/tags/$tag:refs/tags/$tag" || {
+              echo "::error::Tag $tag does not exist on origin."
+              exit 1
+            }
+          else
+            tag=""
+          fi
+          if [ -n "$tag" ]; then
+            case "$tag" in
+              v*) ;;
+              *) echo "::error::Tag $tag is not a v* tag."; exit 1 ;;
+            esac
+            version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+            if [ "v$version" != "$tag" ]; then
+              echo "::error::Tag $tag does not match tauri.conf.json version $version (expected v$version)."
+              exit 1
+            fi
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Create or reuse the draft release
+        id: release
+        if: steps.tag.outputs.tag != ''
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        with:
+          script: |
+            const tag = process.env.TAG;
+            const { owner, repo } = context.repo;
+            const releases = await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 });
+            const existing = releases.find((r) => r.tag_name === tag);
+            if (existing && !existing.draft) {
+              core.setFailed(`Release ${tag} is already published; bump the version and tag again.`);
+              return;
+            }
+            const release = existing ?? (await github.rest.repos.createRelease({
+              owner,
+              repo,
+              tag_name: tag,
+              name: `SkyNexus Connector ${tag.replace(/^v/, "")}`,
+              body: [
+                "The optional SkyNexus Connector: streams your own simulator aircraft to your SkyNexus map.",
+                "",
+                "- Windows: download the `-setup.exe` (per-user install, no admin rights).",
+                "- macOS (X-Plane): download the `.dmg`.",
+                "",
+                "Installed copies update themselves from this release once it is published.",
+              ].join("\n"),
+              draft: true,
+              prerelease: false,
+            })).data;
+            core.info(`draft release ${release.id} for ${tag}`);
+            core.setOutput("release_id", String(release.id));
+
+  windows:
+    name: Windows (NSIS, per-user)
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A manual release run builds the tag, not the branch it was started from.
+          ref: ${{ needs.prepare.outputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
+        with:
+          toolchain: stable # required: pinned to a SHA, the action cannot read the toolchain from the ref
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Check the updater signing key
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::Secret TAURI_SIGNING_PRIVATE_KEY is not set. Generate it with 'npm run tauri signer generate' (RELEASING.md)."
+            exit 1
+          fi
+
+      - name: Fetch SimConnect.dll
+        # Not in the repo (MSFS SDK licence question). Option A: the DLL as a
+        # base64 secret (secrets hold at most 48 KB). Option B: a private
+        # download URL as a secret plus its SHA-256 as a variable.
+        env:
+          SIMCONNECT_DLL_BASE64: ${{ secrets.SIMCONNECT_DLL_BASE64 }}
+          SIMCONNECT_DLL_URL: ${{ secrets.SIMCONNECT_DLL_URL }}
+          SIMCONNECT_DLL_SHA256: ${{ vars.SIMCONNECT_DLL_SHA256 }}
+        run: |
+          set -euo pipefail
+          dest=src-tauri/vendor/SimConnect.dll
+          mkdir -p "$(dirname "$dest")"
+          if [ -n "$SIMCONNECT_DLL_BASE64" ]; then
+            printf '%s' "$SIMCONNECT_DLL_BASE64" | tr -d '\r\n ' | base64 -d > "$dest"
+            echo "SimConnect.dll from secret SIMCONNECT_DLL_BASE64"
+          elif [ -n "$SIMCONNECT_DLL_URL" ]; then
+            if [ -z "$SIMCONNECT_DLL_SHA256" ]; then
+              echo "::error::SIMCONNECT_DLL_URL needs the repository variable SIMCONNECT_DLL_SHA256 to check the download."
+              exit 1
+            fi
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "$SIMCONNECT_DLL_URL" -o "$dest"
+            echo "SimConnect.dll from secret SIMCONNECT_DLL_URL"
+          else
+            echo "::error::SimConnect.dll is not available. Set the secret SIMCONNECT_DLL_BASE64 (the DLL, base64), or the secret SIMCONNECT_DLL_URL plus the variable SIMCONNECT_DLL_SHA256. See RELEASING.md."
+            exit 1
+          fi
+          if [ "$(head -c 2 "$dest")" != "MZ" ]; then
+            echo "::error::The fetched SimConnect.dll is not a Windows DLL."
+            exit 1
+          fi
+          actual="$(sha256sum "$dest" | cut -d' ' -f1)"
+          if [ -n "$SIMCONNECT_DLL_SHA256" ] && [ "$actual" != "$(echo "$SIMCONNECT_DLL_SHA256" | tr 'A-F' 'a-f')" ]; then
+            echo "::error::SimConnect.dll SHA-256 is $actual, expected $SIMCONNECT_DLL_SHA256."
+            exit 1
+          fi
+          echo "SimConnect.dll $(wc -c < "$dest") bytes, sha256 $actual"
+
+      - name: Which Windows signing is configured
+        id: signing
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+        run: |
+          if [ -n "$WINDOWS_CERTIFICATE" ]; then
+            echo "mode=ov" >> "$GITHUB_OUTPUT"; echo "Authenticode: OV certificate (PFX)"
+          elif [ -n "$AZURE_CLIENT_ID" ] && [ -n "$AZURE_SIGNING_ENDPOINT" ]; then
+            echo "mode=azure" >> "$GITHUB_OUTPUT"; echo "Authenticode: Azure Artifact Signing"
+          else
+            echo "mode=none" >> "$GITHUB_OUTPUT"
+            echo "::warning::No Windows code signing configured; the installer will be unsigned (SmartScreen warns)."
+          fi
+
+      - name: Import the OV certificate
+        if: steps.signing.outputs.mode == 'ov'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "connector-cert.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String(($env:WINDOWS_CERTIFICATE -replace '\s', '')))
+          $password = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          Remove-Item $pfx
+          "WINDOWS_CERT_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install artifact-signing-cli
+        if: steps.signing.outputs.mode == 'azure'
+        run: cargo install artifact-signing-cli --locked --version 0.12.0
+
+      - name: Install the Tauri CLI
+        working-directory: .
+        run: npm ci
+
+      - name: Release config
+        working-directory: .
+        env:
+          TAURI_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+          AZURE_SIGNING_ENDPOINT: ${{ steps.signing.outputs.mode == 'azure' && vars.AZURE_SIGNING_ENDPOINT || '' }}
+          AZURE_SIGNING_ACCOUNT: ${{ steps.signing.outputs.mode == 'azure' && vars.AZURE_SIGNING_ACCOUNT || '' }}
+          AZURE_CERT_PROFILE: ${{ steps.signing.outputs.mode == 'azure' && vars.AZURE_CERT_PROFILE || '' }}
+        run: node scripts/release-config.mjs windows
+
+      - name: Build and upload
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        with:
+          projectPath: .
+          tauriScript: npm run tauri
+          args: --config src-tauri/tauri.release.conf.json --bundles nsis
+          releaseId: ${{ needs.prepare.outputs.release_id }}
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+
+      - name: Keep the installer as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: connector-windows
+          path: src-tauri/target/release/bundle/nsis/*
+          retention-days: 14
+
+  macos:
+    name: macOS (universal)
+    # After Windows, never beside it: both jobs merge latest.json on the same
+    # release, and two at once can overwrite each other's platforms. It still
+    # runs when Windows failed, so a dry run always yields a Mac build.
+    needs: [prepare, windows]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A manual release run builds the tag, not the branch it was started from.
+          ref: ${{ needs.prepare.outputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
+        with:
+          toolchain: stable # required: pinned to a SHA, the action cannot read the toolchain from the ref
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Check the updater signing key
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::Secret TAURI_SIGNING_PRIVATE_KEY is not set. Generate it with 'npm run tauri signer generate' (RELEASING.md)."
+            exit 1
+          fi
+
+      - name: Optional Apple signing and notarization
+        # Only the variables that are set reach the Tauri bundler: an empty
+        # APPLE_CERTIFICATE would make it try to import nothing.
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "::warning::No Apple certificate configured; the app is unsigned (Gatekeeper blocks it until the user allows it)."
+            exit 0
+          fi
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY; do
+            value="${!name}"
+            if [ -z "$value" ]; then echo "::error::$name is needed with APPLE_CERTIFICATE."; exit 1; fi
+            delim="EOF_$(openssl rand -hex 8)"
+            printf '%s<<%s\n%s\n%s\n' "$name" "$delim" "$value" "$delim" >> "$GITHUB_ENV"
+          done
+          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            for name in APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+              delim="EOF_$(openssl rand -hex 8)"
+              printf '%s<<%s\n%s\n%s\n' "$name" "$delim" "${!name}" "$delim" >> "$GITHUB_ENV"
+            done
+            echo "signing and notarizing"
+          else
+            echo "::warning::Signing without notarization (APPLE_ID, APPLE_PASSWORD and APPLE_TEAM_ID are not all set)."
+          fi
+
+      - name: Install the Tauri CLI
+        working-directory: .
+        run: npm ci
+
+      - name: Release config
+        working-directory: .
+        env:
+          TAURI_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+        run: node scripts/release-config.mjs macos
+
+      - name: Build and upload
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: .
+          tauriScript: npm run tauri
+          args: --target universal-apple-darwin --config src-tauri/tauri.release.conf.json --bundles app,dmg
+          releaseId: ${{ needs.prepare.outputs.release_id }}
+          uploadUpdaterJson: true
+
+      - name: Keep the bundles as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: connector-macos
+          path: |
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.tar.gz*
+          retention-days: 14

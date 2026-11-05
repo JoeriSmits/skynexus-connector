@@ -129,7 +129,7 @@ src-tauri/
 
 ## Updates and releases
 
-The Tauri updater checks every 6 hours, downloads in the background and installs only while no sim is connected, or on Quit. Checks run only in release builds whose `plugins.updater.pubkey` is a real key (`tauri.conf.json` holds a placeholder until the first release).
+The Tauri updater checks every 6 hours, downloads in the background and installs only while no sim is connected, or on Quit. Checks run only in release builds (debug builds never check). The public key in `tauri.conf.json` is the real one; its private half signs the releases in CI.
 
 Releases come from `.github/workflows/release.yml` on `v*` tags: `scripts/release-config.mjs` writes `src-tauri/tauri.release.conf.json` (updater artifacts on, the real public key from the `TAURI_UPDATER_PUBKEY` variable, `SimConnect.dll` beside the exe on Windows, Authenticode only when configured), and `tauri-action` uploads to a draft release. `npm run test:release` tests that script. The checklist is in [RELEASING.md](RELEASING.md).
 

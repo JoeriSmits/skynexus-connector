@@ -15,8 +15,8 @@ npm run tauri signer generate -- -w ~/.tauri/skynexus-connector.key
 - Repository Settings > Secrets and variables > Actions:
   - secret `TAURI_SIGNING_PRIVATE_KEY`: the contents of `~/.tauri/skynexus-connector.key`;
   - secret `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: the password;
-  - variable `TAURI_UPDATER_PUBKEY`: the contents of `~/.tauri/skynexus-connector.key.pub` (public; it may also replace `REPLACE_WITH_UPDATER_PUBLIC_KEY` in `src-tauri/tauri.conf.json`).
-- While the placeholder is in a build, that build never checks for updates (by design).
+  - variable `TAURI_UPDATER_PUBKEY`: the contents of `~/.tauri/skynexus-connector.key.pub` (public; it is also committed in `src-tauri/tauri.conf.json`).
+- Debug builds never check for updates; release builds use the committed public key.
 
 ### 2. SimConnect.dll (Windows build)
 

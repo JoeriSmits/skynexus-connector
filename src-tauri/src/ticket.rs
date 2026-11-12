@@ -148,6 +148,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ticket_requests_carry_the_app_version() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/connector/ticket"))
+            .and(header("x-connector-version", env!("CARGO_PKG_VERSION")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ticket": "opaque", "expires_in": 900 })),
+            )
+            .expect(1)
+            .mount(&s)
+            .await;
+        let mut m = TicketManager::new(ApiClient::new(&s.uri()), "cred-1".into());
+        m.valid(Instant::now()).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn revoked_credential_is_unauthorized() {
         let s = MockServer::start().await;
         Mock::given(method("POST"))

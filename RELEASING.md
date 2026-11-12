@@ -41,9 +41,11 @@ Unsigned works, with SmartScreen and Gatekeeper warnings.
 
    ```sh
    git checkout main && git pull
-   git tag v0.1.0
-   git push origin v0.1.0
+   git tag v0.1.1
+   git push origin v0.1.1
    ```
 
    The tag must match the version (`v` + `version`), or the workflow stops.
 4. Download the draft's installer, install it over the current one, pair, fly. Only then publish the draft: that is the moment installed copies can see it.
+
+Do not rename the release assets. The website's download links (`skynexus.nl/connector/download/windows` and `/macos`) depend on the asset names `SkyNexus.Connector_{version}_x64-setup.exe` and `SkyNexus.Connector_{version}_universal.dmg`.

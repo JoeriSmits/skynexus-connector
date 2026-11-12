@@ -460,6 +460,7 @@ impl ApiClient {
             .http
             .post(self.url(TICKET_PATH))
             .bearer_auth(credential)
+            .header("X-Connector-Version", env!("CARGO_PKG_VERSION"))
             .send()
             .await?;
         let status = res.status().as_u16();

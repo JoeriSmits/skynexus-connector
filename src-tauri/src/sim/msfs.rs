@@ -8,9 +8,13 @@
 //! The connection is read-only: data definitions and requests, never events
 //! or writes.
 //!
-//! - Own aircraft: `RequestDataOnSimObject` once per second with the
-//!   changed-only flag and per-datum epsilons, so a parked aircraft sends
-//!   almost nothing (the driver adds a heartbeat).
+//! - Own aircraft: `RequestDataOnSimObject` with the changed-only flag and
+//!   per-datum epsilons, so a parked aircraft sends almost nothing (the
+//!   driver adds a heartbeat). Once per second in the air; every 3rd visual
+//!   frame while the aircraft is on the ground and slower than 40 kt, where
+//!   the driver sends 4 Hz. The request is replaced when that state changes
+//!   (with the driver's hysteresis, `rate::RateSelector`), so the long
+//!   airborne part of a flight costs no more SimConnect traffic than before.
 //! - Traffic: `RequestDataOnSimObjectType` every 2 s for aircraft and
 //!   helicopters within 80 km; answers arrive one object per message.
 //! - Flight or menu: `RequestSystemState("Sim")` every 2 s. In the menus and
@@ -28,6 +32,7 @@ use libloading::os::windows::{
 use libloading::Library;
 
 use super::msfs_proto::*;
+use super::rate::{RateMode, RateSelector};
 use super::{Sim, SimError};
 use crate::frame::{now_ms, Frame, Own, SimKind};
 
@@ -71,7 +76,12 @@ struct Api {
 pub struct MsfsSim {
     handle: Handle,
     api: Api,
+    /// The air rate (`--hz`).
     hz: u32,
+    /// Ground or air, from the decoded own-aircraft samples.
+    rate: RateSelector,
+    /// The mode the current own-aircraft request was made for.
+    requested: RateMode,
     traffic: TrafficAssembler,
     own: Option<Own>,
     /// The last "Sim" system state: None until MSFS first answers.
@@ -170,8 +180,9 @@ fn load_simconnect() -> Result<Library, ConnectError> {
 }
 
 impl MsfsSim {
-    /// `hz` is the own-aircraft rate: 1 asks once per second, 2 asks every
-    /// 10th visual frame (the pacer trims to 2 Hz). Both keep the CHANGED flag.
+    /// `hz` is the air rate: 1 asks once per second, 2 asks every 11th
+    /// visual frame (the pacer trims to 2 Hz). On the ground and slow it asks
+    /// every 3rd visual frame whatever `hz` is. All keep the CHANGED flag.
     pub fn connect(hz: u32) -> Result<Self, ConnectError> {
         let lib = load_simconnect()?;
         let (open, api) = load(&lib)?;
@@ -187,6 +198,8 @@ impl MsfsSim {
             handle,
             api,
             hz,
+            rate: RateSelector::default(),
+            requested: RateMode::Air,
             traffic: TrafficAssembler::default(),
             own: None,
             in_flight: None,
@@ -201,11 +214,13 @@ impl MsfsSim {
         Ok(sim)
     }
 
-    /// (Re)starts the own-aircraft request. Asking again with the same request
-    /// id replaces the old one, so this is also how a newly loaded flight's
-    /// user aircraft gets picked up.
+    /// (Re)starts the own-aircraft request for the current rate mode. Asking
+    /// again with the same request id replaces the old one, so this is also
+    /// how a newly loaded flight's user aircraft gets picked up and how the
+    /// rate follows the aircraft between taxi and flight.
     fn request_own(&mut self) -> Result<(), String> {
-        let (period, interval) = own_request_period(self.hz);
+        let mode = self.rate.mode();
+        let (period, interval) = own_request_period(self.hz, mode);
         // SAFETY: open handle, our own definition and request ids.
         let hr = unsafe {
             (self.api.request_data_on_sim_object)(
@@ -223,6 +238,7 @@ impl MsfsSim {
         if hr != S_OK {
             return Err(format!("RequestDataOnSimObject failed ({hr:#x})"));
         }
+        self.requested = mode;
         Ok(())
     }
 
@@ -333,6 +349,10 @@ impl Sim for MsfsSim {
                     if let Some(od) = parse_object_data(msg) {
                         if od.request_id == REQ_OWN {
                             if let Some(own) = decode_own(od.data) {
+                                if self.rate.update(&own) != self.requested {
+                                    log::debug!("msfs: own-aircraft rate for {:?}", self.rate.mode());
+                                    self.request_own().map_err(SimError::Other)?;
+                                }
                                 self.own = Some(own);
                                 own_changed = true;
                             }
@@ -356,6 +376,8 @@ impl Sim for MsfsSim {
                                 self.request_own().map_err(SimError::Other)?;
                             }
                             if !flying {
+                                // The next flight starts at the air rate.
+                                self.rate = RateSelector::default();
                                 self.own = None;
                                 self.traffic = TrafficAssembler::default();
                             }

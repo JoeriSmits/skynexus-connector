@@ -23,7 +23,12 @@ const PATH_LEN: usize = 400;
 pub const MP_SLOTS: usize = 19;
 const MP_FIELDS: [&str; 6] = ["lat", "lon", "el", "psi", "v_x", "v_z"];
 const MP_BASE: i32 = 100;
-const FREQ_HZ: i32 = 5;
+/// Own-aircraft datarefs: 10 Hz, so the driver's 4 Hz while taxiing and
+/// docking always has a sample younger than 100 ms (5 Hz beats against
+/// 4 Hz and repeats stale samples). Localhost and 9 floats: negligible.
+const OWN_FREQ_HZ: i32 = 10;
+/// Multiplayer slots: traffic goes out every 2 s, 5 Hz is plenty.
+const TRAFFIC_FREQ_HZ: i32 = 5;
 const SILENCE_LIMIT: Duration = Duration::from_secs(10);
 
 pub fn rref_request(freq: i32, index: i32, path: &str) -> [u8; REQUEST_LEN] {
@@ -55,6 +60,15 @@ pub fn parse_rref(packet: &[u8]) -> Option<Vec<(i32, f32)>> {
             })
             .collect(),
     )
+}
+
+/// The RREF frequency for a subscription index.
+pub fn freq_for(index: i32) -> i32 {
+    if index < MP_BASE {
+        OWN_FREQ_HZ
+    } else {
+        TRAFFIC_FREQ_HZ
+    }
 }
 
 /// Every subscription as (index, path).
@@ -148,7 +162,7 @@ impl XplaneUdp {
         let target: SocketAddr = ([127, 0, 0, 1], port).into();
         // Subscribe to latitude only, and wait briefly for an answer.
         socket
-            .send_to(&rref_request(FREQ_HZ, 0, OWN_DATAREFS[0]), target)
+            .send_to(&rref_request(freq_for(0), 0, OWN_DATAREFS[0]), target)
             .map_err(|e| e.to_string())?;
         socket
             .set_read_timeout(Some(Duration::from_millis(1200)))
@@ -171,7 +185,7 @@ impl XplaneUdp {
         }
         for (index, path) in subscriptions() {
             socket
-                .send_to(&rref_request(FREQ_HZ, index, &path), target)
+                .send_to(&rref_request(freq_for(index), index, &path), target)
                 .map_err(|e| e.to_string())?;
         }
         socket.set_nonblocking(true).map_err(|e| e.to_string())?;
@@ -286,6 +300,10 @@ mod tests {
         idx.sort();
         idx.dedup();
         assert_eq!(idx.len(), subs.len(), "indices are unique");
+        for (i, _) in &subs {
+            let own = (*i as usize) < OWN_DATAREFS.len();
+            assert_eq!(freq_for(*i), if own { 10 } else { 5 }, "index {i}");
+        }
     }
 
     #[test]

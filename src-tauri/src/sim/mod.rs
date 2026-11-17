@@ -10,10 +10,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::frame::{now_ms, Frame, Own, SimKind, Traffic};
+use rate::{interval_for, RateSelector};
 
 #[cfg(windows)]
 pub mod msfs;
 pub mod msfs_proto;
+pub mod rate;
 pub mod replay;
 pub mod xplane;
 pub mod xplane_udp;
@@ -76,11 +78,14 @@ pub enum SimState {
     Finished,
 }
 
-/// Paces frames: own position at the configured rate when it changes, a
+/// Paces frames: own position when it changes, at most every 250 ms while
+/// taxiing and docking and at the air interval otherwise (see [`rate`]), a
 /// heartbeat while parked so the map does not go stale, and traffic at most
 /// every 2 s.
 pub struct Pacer {
-    interval: Duration,
+    /// The air interval (`--hz`); the ground interval follows from it.
+    air_interval: Duration,
+    rate: RateSelector,
     heartbeat: Duration,
     traffic_every: Duration,
     traffic_max_age: Duration,
@@ -93,9 +98,10 @@ pub struct Pacer {
 }
 
 impl Pacer {
-    pub fn new(interval: Duration) -> Self {
+    pub fn new(air_interval: Duration) -> Self {
         Pacer {
-            interval,
+            air_interval,
+            rate: RateSelector::default(),
             heartbeat: Duration::from_secs(5),
             traffic_every: Duration::from_secs(2),
             traffic_max_age: Duration::from_secs(5),
@@ -109,12 +115,18 @@ impl Pacer {
     }
 
     pub fn reset(&mut self) {
-        *self = Pacer::new(self.interval);
+        *self = Pacer::new(self.air_interval);
+    }
+
+    /// The time between own-aircraft frames right now.
+    pub fn interval(&self) -> Duration {
+        interval_for(self.rate.mode(), self.air_interval)
     }
 
     pub fn ingest(&mut self, f: Frame, now: Instant) {
         let f = f.rounded();
         self.kind = f.sim;
+        self.rate.update(&f.own);
         self.own = Some(f.own);
         if let Some(t) = f.traffic {
             self.traffic = Some((t, now));
@@ -124,7 +136,7 @@ impl Pacer {
     pub fn due(&mut self, now: Instant) -> Option<Frame> {
         let own = self.own.clone()?;
         if let Some(at) = self.last_sent_at {
-            if now.duration_since(at) < self.interval {
+            if now.duration_since(at) < self.interval() {
                 return None;
             }
         }
@@ -200,12 +212,13 @@ fn connect(source: &Source) -> Result<Box<dyn Sim>, NoSim> {
 }
 
 /// Runs on its own thread until `stop` is set: finds a sim, polls it, and
-/// hands paced frames to `out`.
+/// hands paced frames to `out`, with the rate in Hz they are paced at.
+/// `interval` is the air interval.
 pub fn run_driver(
     source: Source,
     interval: Duration,
     stop: &AtomicBool,
-    mut out: impl FnMut(&Frame),
+    mut out: impl FnMut(&Frame, u32),
     mut state: impl FnMut(SimState),
 ) {
     let mut pacer = Pacer::new(interval);
@@ -291,7 +304,7 @@ pub fn run_driver(
         }
         if flying {
             if let Some(frame) = pacer.due(Instant::now()) {
-                out(&frame);
+                out(&frame, rate::hz_of(pacer.interval()));
             }
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -362,6 +375,64 @@ mod tests {
         assert!(p.due(s(5000)).is_some(), "heartbeat after 5 s");
     }
 
+    fn taxiing(lat: f64, gs_kt: f64) -> Frame {
+        let mut f = frame(lat, None);
+        f.own.on_ground = true;
+        f.own.alt_ft = 364.0;
+        f.own.gs_kt = gs_kt;
+        f
+    }
+
+    #[test]
+    fn taxiing_is_paced_at_250_ms_and_flying_at_1_s() {
+        let t0 = Instant::now();
+        let s = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut p = Pacer::new(Duration::from_secs(1));
+        p.ingest(taxiing(50.0, 8.0), t0);
+        assert_eq!(p.interval(), Duration::from_millis(250));
+        assert!(p.due(t0).is_some());
+        p.ingest(taxiing(50.00002, 8.0), s(200));
+        assert!(p.due(s(200)).is_none(), "faster than 4 Hz is held back");
+        assert!(p.due(s(250)).is_some(), "4 Hz on the ground");
+        p.ingest(taxiing(50.00004, 8.0), s(500));
+        assert!(p.due(s(500)).is_some());
+
+        // take-off roll above 45 kt, then airborne: 1 Hz again
+        p.ingest(taxiing(50.001, 60.0), s(750));
+        assert_eq!(p.interval(), Duration::from_secs(1));
+        assert!(p.due(s(750)).is_none(), "1 s after the last frame, not 250 ms");
+        assert!(p.due(s(1500)).is_some());
+        p.ingest(frame(50.01, None), s(2000));
+        assert_eq!(p.interval(), Duration::from_secs(1));
+
+        // --hz 2 in the air still taxis at 4 Hz
+        let mut p = Pacer::new(Duration::from_millis(500));
+        p.ingest(frame(50.0, None), t0);
+        assert_eq!(p.interval(), Duration::from_millis(500));
+        p.ingest(taxiing(50.0, 10.0), t0);
+        assert_eq!(p.interval(), Duration::from_millis(250));
+        p.reset();
+        assert_eq!(
+            p.interval(),
+            Duration::from_millis(500),
+            "a new sim starts at the air rate"
+        );
+    }
+
+    #[test]
+    fn parked_on_the_ground_still_sends_only_a_5_s_heartbeat() {
+        let t0 = Instant::now();
+        let s = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut p = Pacer::new(Duration::from_secs(1));
+        p.ingest(taxiing(50.0, 0.0), t0);
+        assert!(p.due(t0).is_some());
+        for ms in (250..5000).step_by(250) {
+            p.ingest(taxiing(50.0, 0.0), s(ms));
+            assert!(p.due(s(ms)).is_none(), "unchanged at {ms}");
+        }
+        assert!(p.due(s(5000)).is_some(), "heartbeat after 5 s");
+    }
+
     #[test]
     fn traffic_rides_along_every_two_seconds_while_fresh() {
         let t0 = Instant::now();
@@ -396,7 +467,7 @@ mod tests {
             },
             Duration::from_millis(1),
             &stop,
-            |f| frames.push(f.clone()),
+            |f, _| frames.push(f.clone()),
             |s| {
                 if s == SimState::Finished {
                     stop.store(true, Ordering::Relaxed);

@@ -5,6 +5,8 @@
 //! 3. The WebSocket `ws://localhost:8086/api/v1` gets one `dataref_subscribe_values`
 //!    request; X-Plane then pushes `dataref_update_values` at about 10 Hz with
 //!    only the values that changed. Byte-array datarefs arrive base64 encoded.
+//!    That is fast enough for the driver's 4 Hz while taxiing and docking,
+//!    so the adapter asks for no rate of its own.
 //!
 //! Docs: <https://developer.x-plane.com/article/x-plane-web-api/>
 

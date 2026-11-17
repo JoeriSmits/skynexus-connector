@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use super::rate::RateMode;
 use crate::frame::{infer_on_ground, valid_position, Own, Traffic};
 
 pub const SIMCONNECT_DLL: &str = "SimConnect.dll";
@@ -50,18 +51,29 @@ pub const DATATYPE_STRING32: u32 = 6;
 pub const PERIOD_SECOND: u32 = 4;
 pub const PERIOD_VISUAL_FRAME: u32 = 2;
 
-/// Visual frames skipped between own-aircraft samples at `--hz 2`: every
-/// 10th frame is 3 to 6 Hz at 30 to 60 fps, and the pacer trims it to 2 Hz.
+/// Visual frames skipped between own-aircraft samples at `--hz 2` in the
+/// air (SimConnect's `interval`: 0 is every frame, 1 every other): every
+/// 11th frame is 3 to 5 Hz at 30 to 60 fps, and the pacer trims it to 2 Hz.
 pub const VISUAL_FRAME_INTERVAL: u32 = 10;
 
-/// The own-aircraft request period and interval for a rate: once per
-/// second at 1 Hz; every 10th visual frame above that (SimConnect has no
-/// sub-second fixed period). The CHANGED flag stays on in both.
-pub fn own_request_period(hz: u32) -> (u32, u32) {
-    if hz <= 1 {
-        (PERIOD_SECOND, 0)
-    } else {
-        (PERIOD_VISUAL_FRAME, VISUAL_FRAME_INTERVAL)
+/// The same on the ground and slow, where the pacer sends 4 Hz: every 3rd
+/// frame is 5 Hz at 15 fps and 20 Hz at 60 fps, so even a busy airport
+/// that drags the sim down to 15 fps gives a fresh sample for each frame.
+/// The driver polls every 50 ms, so at most about 20 samples a second are
+/// read; the pacer trims them to 4 Hz.
+pub const GROUND_VISUAL_FRAME_INTERVAL: u32 = 2;
+// Every (interval + 1)th frame must give 4 Hz or more at 15 fps.
+const _: () = assert!(15 >= 4 * (GROUND_VISUAL_FRAME_INTERVAL + 1));
+
+/// The own-aircraft request period and interval: on the ground and slow,
+/// every 3rd visual frame (SimConnect has no sub-second fixed period); in
+/// the air, once per second at 1 Hz and every 11th visual frame at 2 Hz.
+/// The CHANGED flag stays on in all of them.
+pub fn own_request_period(air_hz: u32, mode: RateMode) -> (u32, u32) {
+    match mode {
+        RateMode::Ground => (PERIOD_VISUAL_FRAME, GROUND_VISUAL_FRAME_INTERVAL),
+        RateMode::Air if air_hz <= 1 => (PERIOD_SECOND, 0),
+        RateMode::Air => (PERIOD_VISUAL_FRAME, VISUAL_FRAME_INTERVAL),
     }
 }
 
@@ -133,9 +145,12 @@ const ATC_ID: Datum = Datum {
 };
 
 /// Own aircraft, in definition order: 9 doubles then a 32-byte string.
+/// The latitude and longitude epsilon matches the frame's 6 decimals (about
+/// 0.1 m), so a docking aircraft creeping at walking pace still reports
+/// every step.
 pub const OWN_DATUMS: [Datum; 10] = [
-    f64d("PLANE LATITUDE", "degrees", 0.000_01),
-    f64d("PLANE LONGITUDE", "degrees", 0.000_01),
+    f64d("PLANE LATITUDE", "degrees", 0.000_001),
+    f64d("PLANE LONGITUDE", "degrees", 0.000_001),
     f64d("PLANE ALTITUDE", "feet", 1.0),
     f64d("GROUND VELOCITY", "knots", 0.5),
     f64d("PLANE HEADING DEGREES TRUE", "degrees", 0.5),
@@ -462,8 +477,18 @@ pub(crate) mod tests {
 
     #[test]
     fn own_request_rate() {
-        assert_eq!(own_request_period(1), (PERIOD_SECOND, 0));
-        assert_eq!(own_request_period(2), (PERIOD_VISUAL_FRAME, VISUAL_FRAME_INTERVAL));
+        assert_eq!(own_request_period(1, RateMode::Air), (PERIOD_SECOND, 0));
+        assert_eq!(
+            own_request_period(2, RateMode::Air),
+            (PERIOD_VISUAL_FRAME, VISUAL_FRAME_INTERVAL)
+        );
+        for hz in [1, 2] {
+            assert_eq!(
+                own_request_period(hz, RateMode::Ground),
+                (PERIOD_VISUAL_FRAME, GROUND_VISUAL_FRAME_INTERVAL),
+                "taxiing at --hz {hz}"
+            );
+        }
     }
 
     #[test]

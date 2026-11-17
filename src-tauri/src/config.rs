@@ -8,13 +8,15 @@ use clap::Parser;
 /// Production web app. Overridable with `--base-url` for dev.
 pub const DEFAULT_BASE_URL: &str = "https://app.skynexus.nl";
 
+/// Ceiling for the air rate (`--hz`). On the ground and slow the connector
+/// sends 4 Hz whatever `--hz` says (`sim::rate`), under the relay's 5 frames
+/// per second.
+pub const MAX_HZ: u32 = 2;
+
 /// The relay that passes frames to the map. Order of
 /// precedence: `--relay-url`, a `relay_url` in the ticket answer (not sent
 /// today, kept so a Cloudflare relay can take over without a client
 /// release), the build-time `SKYNEXUS_CONNECTOR_RELAY_URL`, then this.
-/// Own-aircraft rate ceiling, well under the relay's 5 frames per second.
-pub const MAX_HZ: u32 = 2;
-
 pub const DEFAULT_RELAY_URL: &str = "wss://charts.skynexus.nl";
 pub const BUILD_RELAY_URL: Option<&str> = option_env!("SKYNEXUS_CONNECTOR_RELAY_URL");
 
@@ -66,7 +68,8 @@ pub struct Cli {
     #[arg(long)]
     pub no_browser: bool,
 
-    /// Own-aircraft frame rate in Hz (1 or 2; the relay allows 5 frames per second).
+    /// Own-aircraft frame rate in the air, in Hz (1 or 2). On the ground below
+    /// 40 kt it is always 4 Hz (the relay allows 5 frames per second).
     #[arg(long, default_value_t = 1)]
     pub hz: u32,
 
@@ -96,6 +99,7 @@ pub struct Config {
     pub print_frames: bool,
     pub ephemeral: bool,
     pub open_browser: bool,
+    /// The air rate; taxiing and docking always go at 4 Hz.
     pub hz: u32,
     /// Started by MSFS (exe.xml): quit once MSFS has closed.
     pub launched_by_msfs: bool,
@@ -173,6 +177,8 @@ impl Config {
         }
     }
 
+    /// The air interval. The ground interval (250 ms) follows from it in
+    /// `sim::rate`.
     pub fn frame_interval(&self) -> Duration {
         Duration::from_millis(1000 / u64::from(self.hz.max(1)))
     }
@@ -310,8 +316,14 @@ mod tests {
         assert_eq!(c.base_url, "http://localhost:3000");
         assert_eq!(c.keychain_account(), "localhost:3000");
         assert_eq!(c.relay_base(Some("wss://other")), "ws://localhost:8787");
-        assert_eq!(c.hz, 2);
+        assert_eq!(c.hz, 2, "--hz is clamped to the air ceiling");
         assert_eq!(c.frame_interval(), Duration::from_millis(500));
+        assert_eq!(cfg(&["--hz", "0"]).hz, 1);
+        assert_eq!(
+            cfg(&["--hz", "4"]).hz,
+            2,
+            "4 Hz is the ground rate, never asked in the air"
+        );
         assert!(c.print_frames);
     }
 

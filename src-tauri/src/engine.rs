@@ -36,6 +36,8 @@ pub struct Status {
     pub auth: Auth,
     pub sim: SimState,
     pub relay: RelayState,
+    /// The own-aircraft rate of the last frame: 4 while taxiing, the air
+    /// rate (`--hz`) otherwise.
     pub hz: u32,
 }
 
@@ -211,7 +213,7 @@ impl Engine {
                     source,
                     interval,
                     &stop,
-                    |f: &Frame| {
+                    |f: &Frame, hz: u32| {
                         let json = f.to_json();
                         if print {
                             println!("{json}");
@@ -219,6 +221,12 @@ impl Engine {
                         if !offline {
                             frames.send_replace(Some(Arc::from(json)));
                         }
+                        // 4 Hz while taxiing, the air rate otherwise.
+                        status.send_if_modified(|st| {
+                            let changed = st.hz != hz;
+                            st.hz = hz;
+                            changed
+                        });
                     },
                     |s| {
                         // A sim that left Connected must never have its last
@@ -436,6 +444,8 @@ mod tests {
         assert_eq!(s.headline(), "Waiting for sim");
         let s = status(Auth::SignedIn, msfs(), RelayState::Connected);
         assert_eq!(s.headline(), "Streaming MSFS 1 Hz");
+        let taxiing = Status { hz: 4, ..s.clone() };
+        assert_eq!(taxiing.headline(), "Streaming MSFS 4 Hz");
         assert_eq!(s.streaming_kind(), Some(SimKind::Msfs));
         let s = status(
             Auth::SignedIn,

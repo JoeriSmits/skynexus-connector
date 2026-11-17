@@ -119,12 +119,14 @@ impl Frame {
             })
     }
 
-    /// Rounds numbers to what the map can show, which keeps frames small:
-    /// 5 decimals of a degree is about 1 m.
+    /// Rounds numbers to what the map can show, which keeps frames small.
+    /// Own position keeps 6 decimals of a degree (about 0.1 m), so the EFB's
+    /// docking board can say STOP within 1 m on real positions; traffic keeps
+    /// 5 (about 1 m), which is all the map draws.
     pub fn rounded(mut self) -> Self {
         let o = &mut self.own;
-        o.lat = round_to(o.lat, 5);
-        o.lon = round_to(o.lon, 5);
+        o.lat = round_to(o.lat, OWN_POSITION_DECIMALS);
+        o.lon = round_to(o.lon, OWN_POSITION_DECIMALS);
         o.alt_ft = o.alt_ft.round();
         o.gs_kt = round_to(o.gs_kt, 1);
         o.hdg = round_to(norm_deg(o.hdg), 1);
@@ -210,6 +212,9 @@ pub fn norm_deg(d: f64) -> f64 {
         r
     }
 }
+
+/// Own-aircraft latitude and longitude decimals: 0.11 m of latitude.
+pub const OWN_POSITION_DECIMALS: i32 = 6;
 
 fn round_to(n: f64, decimals: i32) -> f64 {
     let f = 10f64.powi(decimals);
@@ -332,10 +337,16 @@ mod tests {
         o.hdg = -10.04;
         o.trk = 360.0;
         o.lat = 50.123_456_789;
-        let f = Frame::new(SimKind::Replay, 1, o).rounded();
+        o.lon = 8.987_654_321;
+        let mut f = Frame::new(SimKind::Replay, 1, o);
+        f.traffic = Some(vec![traffic(1, 0.123_456_789)]);
+        let f = f.rounded();
         assert_eq!(f.own.hdg, 350.0);
         assert_eq!(f.own.trk, 0.0);
-        assert_eq!(f.own.lat, 50.123_46);
+        assert_eq!(f.own.lat, 50.123_457, "own: 6 decimals, about 0.1 m");
+        assert_eq!(f.own.lon, 8.987_654);
+        let t = &f.traffic.unwrap()[0];
+        assert_eq!(t.lat, 50.123_46, "traffic: 5 decimals");
     }
 
     #[test]

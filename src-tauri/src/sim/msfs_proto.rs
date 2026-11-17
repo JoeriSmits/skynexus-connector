@@ -145,9 +145,12 @@ const ATC_ID: Datum = Datum {
 };
 
 /// Own aircraft, in definition order: 9 doubles then a 32-byte string.
+/// The latitude and longitude epsilon matches the frame's 6 decimals (about
+/// 0.1 m), so a docking aircraft creeping at walking pace still reports
+/// every step.
 pub const OWN_DATUMS: [Datum; 10] = [
-    f64d("PLANE LATITUDE", "degrees", 0.000_01),
-    f64d("PLANE LONGITUDE", "degrees", 0.000_01),
+    f64d("PLANE LATITUDE", "degrees", 0.000_001),
+    f64d("PLANE LONGITUDE", "degrees", 0.000_001),
     f64d("PLANE ALTITUDE", "feet", 1.0),
     f64d("GROUND VELOCITY", "knots", 0.5),
     f64d("PLANE HEADING DEGREES TRUE", "degrees", 0.5),

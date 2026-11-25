@@ -438,7 +438,10 @@ pub(crate) mod tests {
         assert!(own.on_ground);
         assert_eq!(own.trk, 250.0);
         assert_eq!(own.callsign.as_deref(), Some("DEMO01"));
-        assert!((own.fuel_kg.unwrap() - 10_000.0).abs() < 0.01, "pounds become kilograms");
+        assert!(
+            (own.fuel_kg.unwrap() - 10_000.0).abs() < 0.01,
+            "pounds become kilograms"
+        );
         assert!(decode_own(&od.data[..50]).is_none(), "short block");
         assert!(decode_own(&own_block(f64::NAN, 8.0, 0.0, "")).is_none());
         assert_eq!(decode_own(&own_block(50.0, 8.0, 0.0, "")).unwrap().callsign, None);

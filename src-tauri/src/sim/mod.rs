@@ -392,7 +392,11 @@ mod tests {
             p.ingest(parked(8000.0 - 2.0 * (i as f64 + 1.0)), s(ms));
             assert!(p.due(s(ms)).is_none(), "fuel alone does not send at {ms}");
         }
-        assert_eq!(p.due(s(5000)).unwrap().own.fuel_kg, Some(7992.0), "the heartbeat carries the latest fuel");
+        assert_eq!(
+            p.due(s(5000)).unwrap().own.fuel_kg,
+            Some(7992.0),
+            "the heartbeat carries the latest fuel"
+        );
     }
 
     fn taxiing(lat: f64, gs_kt: f64) -> Frame {

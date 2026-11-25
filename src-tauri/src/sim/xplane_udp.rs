@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn subscriptions_cover_own_and_19_slots() {
         let subs = subscriptions();
-        assert_eq!(subs.len(), 9 + 19 * 6);
+        assert_eq!(subs.len(), OWN_DATAREFS.len() + 19 * 6);
         assert!(subs
             .iter()
             .any(|(i, p)| *i == 190 + 5 && p == "sim/multiplayer/position/plane9_v_z"));

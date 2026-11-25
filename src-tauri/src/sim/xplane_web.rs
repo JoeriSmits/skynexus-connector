@@ -406,6 +406,7 @@ mod tests {
             (100, Role::Own(0)),
             (101, Role::Own(1)),
             (102, Role::Own(2)),
+            (109, Role::Own(9)),
             (110, Role::TcasLat),
             (111, Role::TcasLon),
             (116, Role::TcasFlightId),
@@ -416,13 +417,14 @@ mod tests {
         ids[8..14].copy_from_slice(b"TEST22");
         let b64 = base64::engine::general_purpose::STANDARD.encode(&ids);
         let msg = format!(
-            r#"{{"type":"dataref_update_values","data":{{"100":50.0379,"101":8.5622,"102":111.0,"110":[50.0,50.2],"111":[8.5,8.9],"116":"{b64}","999":1}}}}"#
+            r#"{{"type":"dataref_update_values","data":{{"100":50.0379,"101":8.5622,"102":111.0,"109":6543.2,"110":[50.0,50.2],"111":[8.5,8.9],"116":"{b64}","999":1}}}}"#
         );
         let WsMessage::Update(u) = parse_ws(&msg) else { panic!() };
         let (mut own, mut tcas) = (OwnRaw::default(), TcasRaw::default());
         assert_eq!(apply_update(&u, &roles, &mut own, &mut tcas), (true, true));
         let o = own.to_own().unwrap();
         assert_eq!(o.lat, 50.0379);
+        assert_eq!(o.fuel_kg, Some(6543.2), "m_fuel_total is kilograms already");
         let t = tcas.targets();
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].callsign.as_deref(), Some("TEST22"));

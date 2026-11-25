@@ -89,6 +89,7 @@ mod tests {
             trk: 250.0,
             vs_fpm: 0.0,
             on_ground,
+            fuel_kg: None,
             callsign: None,
         }
     }

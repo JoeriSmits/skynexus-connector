@@ -140,7 +140,7 @@ impl Pacer {
                 return None;
             }
         }
-        let own_changed = self.last_sent_own.as_ref() != Some(&own);
+        let own_changed = self.last_sent_own.as_ref().is_none_or(|last| !last.same_motion(&own));
         let heartbeat = self
             .last_sent_at
             .is_none_or(|at| now.duration_since(at) >= self.heartbeat);
@@ -325,6 +325,7 @@ mod tests {
             trk: 250.0,
             vs_fpm: 0.0,
             on_ground: false,
+            fuel_kg: None,
             callsign: None,
         }
     }
@@ -373,6 +374,29 @@ mod tests {
             assert!(p.due(s(ms)).is_none(), "unchanged at {ms}");
         }
         assert!(p.due(s(5000)).is_some(), "heartbeat after 5 s");
+    }
+
+    #[test]
+    fn apu_fuel_burn_alone_keeps_a_parked_aircraft_on_the_heartbeat() {
+        let t0 = Instant::now();
+        let s = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut p = Pacer::new(Duration::from_secs(1));
+        let parked = |fuel: f64| {
+            let mut f = frame(50.0, None);
+            f.own.fuel_kg = Some(fuel);
+            f
+        };
+        p.ingest(parked(8000.0), t0);
+        assert_eq!(p.due(t0).unwrap().own.fuel_kg, Some(8000.0));
+        for (i, ms) in [1000, 2000, 3000, 4000].into_iter().enumerate() {
+            p.ingest(parked(8000.0 - 2.0 * (i as f64 + 1.0)), s(ms));
+            assert!(p.due(s(ms)).is_none(), "fuel alone does not send at {ms}");
+        }
+        assert_eq!(
+            p.due(s(5000)).unwrap().own.fuel_kg,
+            Some(7992.0),
+            "the heartbeat carries the latest fuel"
+        );
     }
 
     fn taxiing(lat: f64, gs_kt: f64) -> Frame {

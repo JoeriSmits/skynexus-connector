@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::rate::RateMode;
+use crate::frame::units::LB_TO_KG;
 use crate::frame::{infer_on_ground, valid_position, Own, Traffic};
 
 pub const SIMCONNECT_DLL: &str = "SimConnect.dll";
@@ -144,11 +145,11 @@ const ATC_ID: Datum = Datum {
     epsilon: 0.0,
 };
 
-/// Own aircraft, in definition order: 9 doubles then a 32-byte string.
+/// Own aircraft, in definition order: 10 doubles then a 32-byte string.
 /// The latitude and longitude epsilon matches the frame's 6 decimals (about
 /// 0.1 m), so a docking aircraft creeping at walking pace still reports
 /// every step.
-pub const OWN_DATUMS: [Datum; 10] = [
+pub const OWN_DATUMS: [Datum; 11] = [
     f64d("PLANE LATITUDE", "degrees", 0.000_001),
     f64d("PLANE LONGITUDE", "degrees", 0.000_001),
     f64d("PLANE ALTITUDE", "feet", 1.0),
@@ -158,9 +159,12 @@ pub const OWN_DATUMS: [Datum; 10] = [
     f64d("VERTICAL SPEED", "feet per minute", 20.0),
     f64d("SIM ON GROUND", "bool", 0.0),
     f64d("PLANE ALT ABOVE GROUND", "feet", 1.0),
+    // Total fuel on board. A coarse epsilon: the frame keeps whole kilograms
+    // and fuel alone never makes the driver send a frame.
+    f64d("FUEL TOTAL QUANTITY WEIGHT", "pounds", 5.0),
     ATC_ID,
 ];
-pub const OWN_DATA_LEN: usize = 9 * 8 + 32;
+pub const OWN_DATA_LEN: usize = 10 * 8 + 32;
 
 /// Traffic, in definition order: 7 doubles then a 32-byte string.
 pub const TRAFFIC_DATUMS: [Datum; 8] = [
@@ -267,7 +271,8 @@ pub fn decode_own(d: &[u8]) -> Option<Own> {
         trk: v(5)?,
         vs_fpm: v(6)?,
         on_ground: v(7)? >= 0.5,
-        callsign: str_at(d, 9 * 8, 32),
+        fuel_kg: Some(v(9)? * LB_TO_KG),
+        callsign: str_at(d, 10 * 8, 32),
     })
 }
 
@@ -344,7 +349,7 @@ pub(crate) mod tests {
 
     pub fn own_block(lat: f64, lon: f64, on_ground: f64, callsign: &str) -> Vec<u8> {
         let mut d = Vec::new();
-        for v in [lat, lon, 364.0, 12.0, 249.0, 250.0, 0.0, on_ground, 0.0] {
+        for v in [lat, lon, 364.0, 12.0, 249.0, 250.0, 0.0, on_ground, 0.0, 22_046.226_2] {
             d.extend_from_slice(&v.to_le_bytes());
         }
         let mut s = [0u8; 32];
@@ -433,6 +438,10 @@ pub(crate) mod tests {
         assert!(own.on_ground);
         assert_eq!(own.trk, 250.0);
         assert_eq!(own.callsign.as_deref(), Some("DEMO01"));
+        assert!(
+            (own.fuel_kg.unwrap() - 10_000.0).abs() < 0.01,
+            "pounds become kilograms"
+        );
         assert!(decode_own(&od.data[..50]).is_none(), "short block");
         assert!(decode_own(&own_block(f64::NAN, 8.0, 0.0, "")).is_none());
         assert_eq!(decode_own(&own_block(50.0, 8.0, 0.0, "")).unwrap().callsign, None);

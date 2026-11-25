@@ -57,8 +57,30 @@ pub struct Own {
     /// Vertical speed, feet per minute.
     pub vs_fpm: f64,
     pub on_ground: bool,
+    /// Total fuel on board in kilograms, when the sim reports it. Older
+    /// recordings and sims without it leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuel_kg: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callsign: Option<String>,
+}
+
+impl Own {
+    /// Whether the aircraft moved or changed state since `other`. Fuel is left
+    /// out on purpose: an APU burns fuel while parked, and that alone must not
+    /// lift a parked aircraft off its 5 s heartbeat. Fuel rides along on
+    /// every frame that is sent anyway.
+    pub fn same_motion(&self, other: &Own) -> bool {
+        self.lat == other.lat
+            && self.lon == other.lon
+            && self.alt_ft == other.alt_ft
+            && self.gs_kt == other.gs_kt
+            && self.hdg == other.hdg
+            && self.trk == other.trk
+            && self.vs_fpm == other.vs_fpm
+            && self.on_ground == other.on_ground
+            && self.callsign == other.callsign
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -132,6 +154,9 @@ impl Frame {
         o.hdg = round_to(norm_deg(o.hdg), 1);
         o.trk = round_to(norm_deg(o.trk), 1);
         o.vs_fpm = o.vs_fpm.round();
+        // Whole kilograms; a value the relay would not take is dropped, never
+        // the frame (fuel is optional on the wire).
+        o.fuel_kg = o.fuel_kg.filter(|f| f.is_finite() && *f >= 0.0).map(f64::round);
         if let Some(list) = self.traffic.as_mut() {
             for t in list.iter_mut() {
                 t.lat = round_to(t.lat, 5);
@@ -234,6 +259,7 @@ fn approx_dist2(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 pub mod units {
     pub const M_TO_FT: f64 = 3.280_839_895;
     pub const MPS_TO_KT: f64 = 1.943_844_492;
+    pub const LB_TO_KG: f64 = 0.453_592_37;
 }
 
 /// Ground state for traffic whose own on-ground flag is not trustworthy
@@ -264,6 +290,7 @@ mod tests {
             trk: 250.0,
             vs_fpm: 0.0,
             on_ground: true,
+            fuel_kg: None,
             callsign: Some("SNX101".into()),
         }
     }
@@ -299,6 +326,29 @@ mod tests {
         for key in ["id", "callsign", "lat", "lon", "altFt", "gsKt", "hdg", "onGround"] {
             assert!(t.get(key).is_some(), "traffic.{key} missing");
         }
+    }
+
+    #[test]
+    fn fuel_goes_out_as_whole_kilograms_and_bad_fuel_is_dropped() {
+        let mut o = own();
+        o.fuel_kg = Some(12_345.6);
+        let f = Frame::new(SimKind::Msfs, 1, o.clone()).rounded();
+        assert!(f.to_json().contains("\"fuelKg\":12346.0"));
+        assert!(f.is_valid());
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+            o.fuel_kg = Some(bad);
+            let f = Frame::new(SimKind::Msfs, 1, o.clone()).rounded();
+            assert_eq!(f.own.fuel_kg, None, "{bad} is dropped");
+            assert!(f.is_valid(), "the frame survives {bad}");
+            assert!(!f.to_json().contains("fuelKg"));
+        }
+    }
+
+    #[test]
+    fn a_frame_without_fuel_still_parses() {
+        let json = r#"{"v":1,"t":1,"sim":"replay","own":{"lat":50.0,"lon":8.0,"altFt":364,"gsKt":0,"hdg":0,"trk":0,"vsFpm":0,"onGround":true}}"#;
+        let f: Frame = serde_json::from_str(json).unwrap();
+        assert_eq!(f.own.fuel_kg, None);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "skynexus-connector"
-version = "0.1.2"
+version = "0.1.3"
 description = "SkyNexus Connector: streams your own simulator aircraft and its traffic to your SkyNexus map"
 authors = ["SkyNexus"]
 edition = "2021"

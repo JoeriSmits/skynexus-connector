@@ -5,7 +5,7 @@ use crate::frame::units::{MPS_TO_KT, M_TO_FT};
 use crate::frame::{valid_position, Own, Traffic};
 
 /// Own-aircraft datarefs, in the order of [`OwnRaw::set`].
-pub const OWN_DATAREFS: [&str; 9] = [
+pub const OWN_DATAREFS: [&str; 10] = [
     "sim/flightmodel/position/latitude",
     "sim/flightmodel/position/longitude",
     "sim/flightmodel/position/elevation",
@@ -15,6 +15,8 @@ pub const OWN_DATAREFS: [&str; 9] = [
     "sim/flightmodel/position/hpath",
     "sim/flightmodel/position/vh_ind_fpm",
     "sim/flightmodel/failures/onground_any",
+    // Total fuel on board, kilograms.
+    "sim/flightmodel/weight/m_fuel_total",
 ];
 
 /// TCAS target arrays (filled by xPilot through XPMP2, LiveTraffic and X-Plane AI).
@@ -47,6 +49,7 @@ pub struct OwnRaw {
     pub hpath: Option<f64>,
     pub vs_fpm: Option<f64>,
     pub on_ground: Option<f64>,
+    pub fuel_kg: Option<f64>,
 }
 
 impl OwnRaw {
@@ -62,6 +65,7 @@ impl OwnRaw {
             6 => &mut self.hpath,
             7 => &mut self.vs_fpm,
             8 => &mut self.on_ground,
+            9 => &mut self.fuel_kg,
             _ => return,
         };
         *slot = Some(v);
@@ -92,6 +96,7 @@ impl OwnRaw {
             trk,
             vs_fpm: self.vs_fpm.unwrap_or(0.0),
             on_ground,
+            fuel_kg: self.fuel_kg,
             callsign: None,
         })
     }

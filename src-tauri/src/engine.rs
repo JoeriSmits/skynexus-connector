@@ -500,6 +500,7 @@ mod tests {
             trk: 249.0,
             vs_fpm: 0.0,
             on_ground: true,
+            fuel_kg: None,
             callsign: None,
         };
         let lines: Vec<String> = (0..3)

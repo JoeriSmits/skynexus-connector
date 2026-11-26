@@ -135,10 +135,14 @@ impl TechlogClient {
     }
 }
 
-/// A transport failure. Timeouts are reported as such; everything else
-/// (refused, reset, closed mid-response) means TechLog is not answering.
+/// A transport failure. Any failure while connecting (refused, unreachable,
+/// connect timeout) means TechLog is not running: Windows only reports a
+/// refused localhost port after ~2 s, which looks like a timeout. Only a
+/// timeout after the connection was made is a real `Timeout`.
 fn transport_code(e: reqwest::Error) -> Code {
-    if e.is_timeout() {
+    if e.is_connect() {
+        Code::NotRunning
+    } else if e.is_timeout() {
         Code::Timeout
     } else {
         Code::NotRunning
@@ -197,6 +201,19 @@ mod tests {
         assert_eq!(code, Code::Ok);
         assert_eq!(version.as_deref(), Some("2.1.2"));
         assert!(state.is_some());
+    }
+
+    #[tokio::test]
+    async fn connect_timeout_is_not_running() {
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let err = http.get("http://10.255.255.1:81/").send().await.unwrap_err();
+        // Offline CI may fail the route at once; both are connect failures.
+        assert!(err.is_connect(), "{err:?}");
+        assert_eq!(transport_code(err), Code::NotRunning);
     }
 
     #[tokio::test]

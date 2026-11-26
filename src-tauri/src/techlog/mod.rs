@@ -4,5 +4,6 @@
 //! Layout: `model` (the parts of TechLog's JSON we read), `snapshot` (our own
 //! wire object and its hash).
 
+pub mod client;
 pub mod model;
 pub mod snapshot;

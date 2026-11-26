@@ -4,7 +4,7 @@
 //! - Reads every 15 s while TechLog answers `OK`, every 30 s otherwise; the
 //!   next read is timed from the end of the previous one (a read can take
 //!   about 10 s when both requests time out).
-//! - POSTs when the code or the snapshot hash changed, and every 30 min while
+//! - POSTs when the code or the snapshot hash changed, and every 20 min while
 //!   TechLog is present so the server knows the data is still fresh.
 //! - After SkyNexus accepted a snapshot, its short hash goes on `tl_out` for
 //!   the own-ship frame; after a health-only POST, `tl_out` is cleared.
@@ -31,6 +31,10 @@ pub const HEALTH_SCHEMA: u8 = 1;
 /// The longest `Retry-After` honoured from the TechLog route.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
 
+/// Resend an unchanged `OK` snapshot this often: well inside the EFB's 30 min freshness window,
+/// so data the pilot is looking at never ages to stale while TechLog is up.
+pub const KEEPALIVE: Duration = Duration::from_secs(20 * 60);
+
 #[derive(Debug, Clone, Copy)]
 pub struct RunnerTiming {
     /// Between reads while TechLog does not answer `OK`.
@@ -46,7 +50,7 @@ impl Default for RunnerTiming {
         RunnerTiming {
             absent_every: Duration::from_secs(30),
             present_every: Duration::from_secs(15),
-            keepalive: Duration::from_secs(30 * 60),
+            keepalive: KEEPALIVE,
         }
     }
 }
@@ -684,9 +688,15 @@ mod tests {
     }
 
     #[test]
+    fn default_keepalive_is_inside_the_freshness_window() {
+        assert_eq!(RunnerTiming::default().keepalive, Duration::from_secs(20 * 60));
+        assert!(KEEPALIVE < Duration::from_secs(30 * 60));
+    }
+
+    #[test]
     fn keepalive_only_while_present() {
         let t0 = Instant::now();
-        let k = Duration::from_secs(30 * 60);
+        let k = KEEPALIVE;
         let mut t = Tracker::default();
         t.refused(&Code::Ok, Some("h0"));
         assert!(
@@ -695,8 +705,8 @@ mod tests {
         );
         assert!(t.due(&Code::Ok, Some("h1"), t0, k), "first read");
         t.sent(&Code::Ok, Some("h1"), t0);
-        assert!(!t.due(&Code::Ok, Some("h1"), t0 + Duration::from_secs(29 * 60), k));
-        assert!(t.due(&Code::Ok, Some("h1"), t0 + k, k), "30 min keepalive");
+        assert!(!t.due(&Code::Ok, Some("h1"), t0 + Duration::from_secs(19 * 60), k));
+        assert!(t.due(&Code::Ok, Some("h1"), t0 + k, k), "20 min keepalive");
         assert!(t.due(&Code::Ok, Some("h2"), t0, k), "hash changed");
         t.sent(&Code::NotRunning, None, t0);
         assert!(

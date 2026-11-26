@@ -204,6 +204,37 @@ impl Frame {
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("frame serialises")
     }
+
+    /// The JSON with `own.tl` set to `tl`, without copying the frame. A frame
+    /// that already carries its own `tl` keeps it.
+    pub fn to_json_with_tl(&self, tl: Option<&str>) -> String {
+        if tl.is_none() || self.own.tl.is_some() {
+            return self.to_json();
+        }
+        #[derive(Serialize)]
+        struct OwnWithTl<'a> {
+            #[serde(flatten)]
+            own: &'a Own,
+            tl: Option<&'a str>,
+        }
+        #[derive(Serialize)]
+        struct View<'a> {
+            v: u8,
+            t: u64,
+            sim: SimKind,
+            own: OwnWithTl<'a>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            traffic: &'a Option<Vec<Traffic>>,
+        }
+        let view = View {
+            v: self.v,
+            t: self.t,
+            sim: self.sim,
+            own: OwnWithTl { own: &self.own, tl },
+            traffic: &self.traffic,
+        };
+        serde_json::to_string(&view).expect("frame serialises")
+    }
 }
 
 fn printable_ascii(c: char) -> bool {
@@ -360,6 +391,17 @@ mod tests {
             .to_json()
             .contains("\"tl\":\"0123456789ab\""));
         assert!(o.same_motion(&before), "a new TechLog hash alone is not motion");
+    }
+
+    #[test]
+    fn with_tl_matches_a_frame_that_carries_it() {
+        let mut f = Frame::new(SimKind::Msfs, 1, own());
+        f.traffic = Some(vec![traffic(1, 0.1)]);
+        let json = f.to_json_with_tl(Some("0123456789ab"));
+        let mut with = f.clone();
+        with.own.tl = Some("0123456789ab".into());
+        assert_eq!(serde_json::from_str::<Frame>(&json).unwrap(), with);
+        assert_eq!(f.to_json_with_tl(None), f.to_json());
     }
 
     #[test]

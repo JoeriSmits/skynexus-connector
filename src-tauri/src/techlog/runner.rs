@@ -59,20 +59,28 @@ pub struct RunnerCfg {
     pub timing: RunnerTiming,
 }
 
-/// What was last accepted by SkyNexus (or refused with 422, which is not
-/// retried for the same content).
+type Key = (Code, Option<String>);
+
+fn same(k: &Option<Key>, code: &Code, hash: Option<&str>) -> bool {
+    k.as_ref().is_some_and(|(c, h)| c == code && h.as_deref() == hash)
+}
+
+/// What SkyNexus last accepted, and what it last refused with 422 (never
+/// sent again, not even as a keep-alive, until the state changes).
 #[derive(Debug, Default)]
 struct Tracker {
-    last: Option<(Code, Option<String>)>,
+    last: Option<Key>,
     last_post_at: Option<Instant>,
+    refused: Option<Key>,
 }
 
 impl Tracker {
-    fn due(&self, code: &Code, hash: Option<&str>, now: Instant, keepalive: Duration) -> bool {
-        let changed = self
-            .last
-            .as_ref()
-            .is_none_or(|(c, h)| c != code || h.as_deref() != hash);
+    fn due(&mut self, code: &Code, hash: Option<&str>, now: Instant, keepalive: Duration) -> bool {
+        if same(&self.refused, code, hash) {
+            return false;
+        }
+        self.refused = None;
+        let changed = !same(&self.last, code, hash);
         let stale = *code == Code::Ok && self.last_post_at.is_none_or(|at| now.duration_since(at) >= keepalive);
         changed || stale
     }
@@ -80,6 +88,30 @@ impl Tracker {
     fn sent(&mut self, code: &Code, hash: Option<&str>, now: Instant) {
         self.last = Some((code.clone(), hash.map(str::to_string)));
         self.last_post_at = Some(now);
+    }
+
+    fn refused(&mut self, code: &Code, hash: Option<&str>) {
+        self.refused = Some((code.clone(), hash.map(str::to_string)));
+    }
+}
+
+/// The server's pattern for `techlogVersion`: `^\d{1,4}(\.\d{1,4}){1,3}$`.
+fn valid_version(v: &str) -> bool {
+    let parts: Vec<&str> = v.split('.').collect();
+    (2..=4).contains(&parts.len())
+        && parts
+            .iter()
+            .all(|p| (1..=4).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The TechLog version as the server accepts it. A read that is otherwise
+/// `OK` but has no usable version becomes `TL_SCHEMA` at `ping.version`, so
+/// it goes out as health only.
+fn checked_version(code: Code, version: Option<String>) -> (Code, Option<String>) {
+    let version = version.filter(|v| valid_version(v));
+    match (code, version) {
+        (Code::Ok, None) => (Code::Schema("ping.version".into()), None),
+        (code, version) => (code, version),
     }
 }
 
@@ -185,12 +217,15 @@ pub async fn run(
         let credential = credential.expect("checked above");
 
         let (code, version, state) = client.read().await;
+        let (code, version) = checked_version(code, version);
         if last_code.as_ref() != Some(&code) {
             log::info!("techlog: {}", describe(&code));
             last_code = Some(code.clone());
         }
         let snap = match (&code, &state) {
-            (Code::Ok, Some(s)) => snapshot::build(s, version.as_deref().unwrap_or_default(), chrono::Utc::now()),
+            (Code::Ok, Some(s)) => version
+                .as_deref()
+                .and_then(|v| snapshot::build(s, v, chrono::Utc::now())),
             _ => None,
         };
         let hash = snap.as_ref().map(|s| s.hash.clone());
@@ -202,9 +237,13 @@ pub async fn run(
         let now = Instant::now();
         if tracker.due(&code, hash.as_deref(), now, timing.keepalive) {
             let (b, sent_hash) = body(health(&code, version.as_deref()), snap);
-            match api.post_techlog(&credential, &b).await {
+            let result = api.post_techlog(&credential, &b).await;
+            // Any answer from SkyNexus ends a "cannot reach" streak.
+            if !matches!(result, Err(ApiError::Network(_))) {
+                post_failing = false;
+            }
+            match result {
                 Ok(()) => {
-                    post_failing = false;
                     // Tracked by the read hash, so a trimmed snapshot is not re-sent every read.
                     tracker.sent(&code, hash.as_deref(), now);
                     publish(&tl_out, sent_hash.as_deref().map(snapshot::short));
@@ -215,7 +254,7 @@ pub async fn run(
                 }
                 Err(ApiError::InvalidBody { path }) => {
                     log::warn!("techlog: SkyNexus refused the body at {path}; not resending this state");
-                    tracker.sent(&code, hash.as_deref(), now);
+                    tracker.refused(&code, hash.as_deref());
                 }
                 Err(ApiError::Disabled) => {
                     log::info!("techlog: switched off on SkyNexus; asking again on the next ticket");
@@ -224,9 +263,13 @@ pub async fn run(
                     cfg.features.borrow_and_update();
                 }
                 Err(e) => {
-                    if !post_failing {
-                        log::warn!("techlog: cannot reach SkyNexus ({e}); retrying");
-                        post_failing = true;
+                    if matches!(e, ApiError::Network(_)) {
+                        if !post_failing {
+                            log::warn!("techlog: cannot reach SkyNexus ({e}); retrying");
+                            post_failing = true;
+                        }
+                    } else {
+                        log::info!("techlog: SkyNexus answered: {e}; retrying");
                     }
                     wait = wait.max(e.retry_after().unwrap_or_default().min(MAX_RETRY_AFTER));
                 }
@@ -532,13 +575,80 @@ mod tests {
 
     #[tokio::test]
     async fn an_invalid_body_is_not_resent() {
-        let tl = techlog_with(&fixture(STATE)).await;
+        let tl = techlog().await;
+        let first = ResponseTemplate::new(200).set_body_string(fixture(STATE));
+        mount_techlog(&tl, first, Some(20), 1).await;
+        let later = ResponseTemplate::new(200).set_body_string(changed_state());
+        mount_techlog(&tl, later, None, 5).await;
         let invalid = json!({ "error": "invalid_body", "path": "snapshot.dispatch" });
         let a = app(ResponseTemplate::new(422).set_body_json(invalid)).await;
-        let h = start(&tl.uri(), &a, fast(), true);
-        pings_at_least(&tl, 8).await;
-        assert_eq!(posts(&a).await.len(), 1);
+        let timing = RunnerTiming {
+            keepalive: Duration::from_millis(30),
+            ..fast()
+        };
+        let h = start(&tl.uri(), &a, timing, true);
+        pings_at_least(&tl, 18).await;
+        assert_eq!(posts(&a).await.len(), 1, "not even as a keep-alive");
         assert_eq!(*h.tl.borrow(), None);
+        // the state changes: that is sent
+        until("the post of the new state", async || posts(&a).await.len() == 2).await;
+    }
+
+    async fn techlog_with_ping(ping: &str) -> MockServer {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/ping"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ping))
+            .mount(&s)
+            .await;
+        mount_techlog(&s, ResponseTemplate::new(200).set_body_string(fixture(STATE)), None, 5).await;
+        s
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_odd_version_sends_health_only() {
+        for ping in [
+            r#"{"ok":true,"app":"TechLog"}"#,
+            r#"{"ok":true,"app":"TechLog","version":"v2.1.2"}"#,
+        ] {
+            let tl = techlog_with_ping(ping).await;
+            let a = app(ResponseTemplate::new(204)).await;
+            let h = start(&tl.uri(), &a, fast(), true);
+            pings_at_least(&tl, 5).await;
+            let sent = posts(&a).await;
+            assert_eq!(sent.len(), 1, "{ping}");
+            assert_eq!(code(&sent[0]), "TL_SCHEMA");
+            assert_eq!(sent[0]["health"]["path"], "ping.version");
+            assert!(sent[0]["health"].get("techlogVersion").is_none(), "{ping}");
+            assert!(sent[0].get("snapshot").is_none(), "{ping}");
+            assert_eq!(*h.tl.borrow(), None);
+        }
+    }
+
+    #[test]
+    fn version_pattern() {
+        for ok in ["2.1", "2.1.2", "2026.11.26.1", "0.0"] {
+            assert!(valid_version(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "2",
+            "v2.1.2",
+            "2.1.2-beta",
+            "2.1.2.3.4",
+            "12345.1",
+            "2..1",
+            "2.1.",
+            "2.x",
+        ] {
+            assert!(!valid_version(bad), "{bad}");
+        }
+        let (c, v) = checked_version(Code::Http(500), Some("v2".into()));
+        assert_eq!(
+            (c, v),
+            (Code::Http(500), None),
+            "an odd version is just left out of other codes"
+        );
     }
 
     #[tokio::test]
@@ -567,6 +677,11 @@ mod tests {
         let t0 = Instant::now();
         let k = Duration::from_secs(30 * 60);
         let mut t = Tracker::default();
+        t.refused(&Code::Ok, Some("h0"));
+        assert!(
+            !t.due(&Code::Ok, Some("h0"), t0 + k, k),
+            "a refused state is never resent"
+        );
         assert!(t.due(&Code::Ok, Some("h1"), t0, k), "first read");
         t.sent(&Code::Ok, Some("h1"), t0);
         assert!(!t.due(&Code::Ok, Some("h1"), t0 + Duration::from_secs(29 * 60), k));

@@ -194,7 +194,12 @@ impl Engine {
         });
     }
 
+    /// The credential for the TechLog runner. Signing out also forgets the
+    /// last ticket's `features.techlog`, so another account waits for its own.
     fn set_credential(&self, c: Option<&Credential>) {
+        if c.is_none() {
+            self.techlog_features.send_replace(false);
+        }
         self.credential_tx.send_replace(c.map(|c| c.credential.clone()));
     }
 
@@ -245,7 +250,7 @@ impl Engine {
                     interval,
                     &stop,
                     |f: &Frame, hz: u32| {
-                        let json = frame_json(f, tl.borrow().clone());
+                        let json = f.to_json_with_tl(tl.borrow().as_deref());
                         if print {
                             println!("{json}");
                         }
@@ -465,18 +470,6 @@ impl Engine {
     }
 }
 
-/// The frame as sent, with the TechLog hash on the own ship when there is one.
-fn frame_json(f: &Frame, tl: Option<String>) -> String {
-    match tl {
-        Some(_) => {
-            let mut f = f.clone();
-            f.own.tl = tl;
-            f.to_json()
-        }
-        None => f.to_json(),
-    }
-}
-
 fn capitalise(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
@@ -639,8 +632,8 @@ mod tests {
             tl: None,
         };
         let f = Frame::new(SimKind::Msfs, 1, own);
-        assert!(!frame_json(&f, None).contains("\"tl\""));
-        let json = frame_json(&f, Some("0123456789ab".into()));
+        assert!(!f.to_json_with_tl(None).contains("\"tl\""));
+        let json = f.to_json_with_tl(Some("0123456789ab"));
         assert!(json.contains(r#""tl":"0123456789ab""#), "{json}");
     }
 
@@ -682,7 +675,13 @@ mod tests {
             credential: "snc_kept".into(),
             device_id: None,
         });
+        engine.techlog_features.send_replace(true);
         engine.sign_out();
+        assert!(
+            !*engine.techlog_features.borrow(),
+            "a new account waits for its own ticket"
+        );
+        assert_eq!(*engine.credential_tx.borrow(), None);
         let started = std::time::Instant::now();
         engine.shutdown();
         let waited = started.elapsed();

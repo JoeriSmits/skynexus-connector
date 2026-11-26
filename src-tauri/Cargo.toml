@@ -40,6 +40,10 @@ base64 = "0.22"
 thiserror = "2"
 url = "2"
 rand = "0.9"
+sha2 = "0.10"
+hex = "0.4"
+serde_path_to_error = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 [target.'cfg(windows)'.dependencies]
 libloading = "0.9"

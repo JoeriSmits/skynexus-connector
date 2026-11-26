@@ -4,7 +4,7 @@
 //! Layout: `frame` (wire schema), `api` (web app routes), `pairing`,
 //! `credentials`, `ticket`, `relay`, `sim` (adapters and pacing), `engine`
 //! (lifetimes), `tray` (UI), `config` (flags), `msfs_launch` (start and stop
-//! with MSFS), `logs` (the log file).
+//! with MSFS), `logs` (the log file), `techlog` (the TechLog link).
 
 pub mod api;
 pub mod config;
@@ -16,6 +16,7 @@ pub mod msfs_launch;
 pub mod pairing;
 pub mod relay;
 pub mod sim;
+pub mod techlog;
 pub mod ticket;
 mod tray;
 

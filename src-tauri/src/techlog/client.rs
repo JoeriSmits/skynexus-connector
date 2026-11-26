@@ -79,8 +79,10 @@ impl TechlogClient {
             .user_agent(concat!("SkyNexusConnector/", env!("CARGO_PKG_VERSION")))
             .timeout(timeout)
             .connect_timeout(CONNECT_TIMEOUT)
-            // Localhost traffic must never go through a system proxy.
+            // Localhost traffic must never go through a system proxy, and
+            // never follow a redirect off the TechLog port.
             .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("http client");
         TechlogClient { http, base }
@@ -242,6 +244,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_redirect_is_not_followed() {
+        let s = MockServer::start().await;
+        mock(
+            &s,
+            "/api/ping",
+            ResponseTemplate::new(302).insert_header("location", "http://example.com/api/ping"),
+        )
+        .await;
+        assert_eq!(client(&s).read().await.0, Code::Http(302));
+    }
+
+    #[tokio::test]
     async fn ping_timeout() {
         let s = MockServer::start().await;
         mock(&s, "/api/ping", ping_ok().set_delay(Duration::from_secs(2))).await;
@@ -295,6 +309,6 @@ mod tests {
         .await;
         let (code, _, _) = client(&s).read().await;
         assert_eq!(code.as_str(), "TL_SCHEMA");
-        assert!(code.path().is_some());
+        assert_eq!(code.path(), Some("dispatch"));
     }
 }

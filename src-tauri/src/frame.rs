@@ -63,13 +63,18 @@ pub struct Own {
     pub fuel_kg: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callsign: Option<String>,
+    /// The short hash (12 hex) of the TechLog snapshot SkyNexus last
+    /// accepted, so open EFB tabs refetch only when TechLog changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tl: Option<String>,
 }
 
 impl Own {
-    /// Whether the aircraft moved or changed state since `other`. Fuel is left
-    /// out on purpose: an APU burns fuel while parked, and that alone must not
-    /// lift a parked aircraft off its 5 s heartbeat. Fuel rides along on
-    /// every frame that is sent anyway.
+    /// Whether the aircraft moved or changed state since `other`. Fuel and
+    /// `tl` are left out on purpose: an APU burns fuel while parked, and that
+    /// alone must not lift a parked aircraft off its 5 s heartbeat; a new
+    /// TechLog hash is not motion either. Both ride along on every frame
+    /// that is sent anyway.
     pub fn same_motion(&self, other: &Own) -> bool {
         self.lat == other.lat
             && self.lon == other.lon
@@ -292,6 +297,7 @@ mod tests {
             on_ground: true,
             fuel_kg: None,
             callsign: Some("SNX101".into()),
+            tl: None,
         }
     }
 
@@ -342,6 +348,18 @@ mod tests {
             assert!(f.is_valid(), "the frame survives {bad}");
             assert!(!f.to_json().contains("fuelKg"));
         }
+    }
+
+    #[test]
+    fn tl_is_sent_when_set_and_is_not_motion() {
+        let mut o = own();
+        assert!(!Frame::new(SimKind::Msfs, 1, o.clone()).to_json().contains("\"tl\""));
+        let before = o.clone();
+        o.tl = Some("0123456789ab".into());
+        assert!(Frame::new(SimKind::Msfs, 1, o.clone())
+            .to_json()
+            .contains("\"tl\":\"0123456789ab\""));
+        assert!(o.same_motion(&before), "a new TechLog hash alone is not motion");
     }
 
     #[test]

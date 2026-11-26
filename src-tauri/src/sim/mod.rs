@@ -327,6 +327,7 @@ mod tests {
             on_ground: false,
             fuel_kg: None,
             callsign: None,
+            tl: None,
         }
     }
 

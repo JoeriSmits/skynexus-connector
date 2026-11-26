@@ -98,6 +98,7 @@ impl OwnRaw {
             on_ground,
             fuel_kg: self.fuel_kg,
             callsign: None,
+            tl: None,
         })
     }
 }

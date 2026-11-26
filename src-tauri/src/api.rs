@@ -9,11 +9,15 @@
 //!   400 `{error}` with `authorization_pending`, `slow_down`, `access_denied`,
 //!   `expired_token` or `invalid_grant`; 429 `slow_down`; 5xx transient.
 //! - `POST /api/connector/ticket` with `Authorization: Bearer snc_...`
-//!   -> 200 `{ticket, role: "connector", expires_in: 900, expires_at: ISO}`;
+//!   -> 200 `{ticket, role: "connector", expires_in: 900, expires_at: ISO, features?: {techlog}}`;
 //!   401 `invalid_credential` | `revoked` (signed out); 403 `not_enabled`
 //!   (keep the credential, retry later); 429; 503.
 //! - `DELETE /api/connector/devices` with the bearer credential: sign-out
 //!   self-revoke, idempotent.
+//! - `POST /api/connector/techlog` with the bearer credential and
+//!   `{health, snapshot?}` -> 204; 401 `invalid_credential` | `revoked`;
+//!   422 `{error: "invalid_body", path}`; 429; 503 `disabled` (kill switch)
+//!   or another 503 (transient).
 
 use std::time::{Duration, Instant};
 
@@ -24,6 +28,7 @@ pub const PAIR_START_PATH: &str = "/api/connector/pair/start";
 pub const PAIR_POLL_PATH: &str = "/api/connector/pair/poll";
 pub const TICKET_PATH: &str = "/api/connector/ticket";
 pub const DEVICES_PATH: &str = "/api/connector/devices";
+pub const TECHLOG_PATH: &str = "/api/connector/techlog";
 
 /// RFC 8628 section 3.2: the default poll interval when the server sends none.
 pub const DEFAULT_POLL_INTERVAL_S: u64 = 5;
@@ -50,6 +55,13 @@ pub enum ApiError {
     /// 503 `busy` or `unavailable`: transient.
     #[error("SkyNexus is busy")]
     Unavailable { retry_after: Option<Duration> },
+    /// 422 `invalid_body`: the server refused what we sent; `path` names the
+    /// first field it did not accept.
+    #[error("SkyNexus refused the TechLog body at {path}")]
+    InvalidBody { path: String },
+    /// 503 `disabled`: the TechLog link is switched off on the server.
+    #[error("SkyNexus has the TechLog link switched off")]
+    Disabled,
     #[error("unexpected answer from SkyNexus: {0}")]
     Protocol(String),
 }
@@ -224,6 +236,9 @@ struct TicketBody {
     expires_in: Option<u64>,
     #[serde(default)]
     relay_url: Option<String>,
+    /// `{techlog: bool}`; lenient, so an odd value never costs the ticket.
+    #[serde(default)]
+    features: Option<serde_json::Value>,
 }
 
 /// A short-lived relay ticket (ES256 JWT, about 15 minutes).
@@ -241,6 +256,9 @@ pub struct Ticket {
     /// Local clock minus server clock, in seconds, from the JWT `iat`.
     pub clock_skew_s: Option<i64>,
     pub relay_url: Option<String>,
+    /// `features.techlog`: the server allows the TechLog link. A missing
+    /// `features` means false.
+    pub techlog: bool,
 }
 
 impl Ticket {
@@ -256,6 +274,7 @@ impl std::fmt::Debug for Ticket {
             .field("lifetime", &self.lifetime)
             .field("clock_skew_s", &self.clock_skew_s)
             .field("relay_url", &self.relay_url)
+            .field("techlog", &self.techlog)
             .finish()
     }
 }
@@ -295,6 +314,12 @@ pub fn parse_ticket(body: &str, now_ms: u64, received: Instant) -> Result<Ticket
         received,
         clock_skew_s,
         relay_url: b.relay_url.filter(|u| !u.is_empty()),
+        techlog: b
+            .features
+            .as_ref()
+            .and_then(|f| f.get("techlog"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -477,6 +502,35 @@ impl ApiClient {
         }
     }
 
+    /// Sends one TechLog health report, with a snapshot when there is one.
+    pub async fn post_techlog(&self, credential: &str, body: &serde_json::Value) -> Result<(), ApiError> {
+        let res = self
+            .http
+            .post(self.url(TECHLOG_PATH))
+            .bearer_auth(credential)
+            .header("X-Connector-Version", env!("CARGO_PKG_VERSION"))
+            .json(body)
+            .send()
+            .await?;
+        let status = res.status().as_u16();
+        let retry_after = retry_after_of(&res);
+        let text = res.text().await?;
+        match status {
+            200..=299 => Ok(()),
+            401 => Err(ApiError::Unauthorized),
+            422 => Err(ApiError::InvalidBody {
+                path: serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|v| v.get("path")?.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "?".into()),
+            }),
+            429 => Err(ApiError::RateLimited { retry_after }),
+            503 if error_code(&text).as_deref() == Some("disabled") => Err(ApiError::Disabled),
+            503 => Err(service_unavailable(&text, retry_after)),
+            s => Err(ApiError::Protocol(format!("techlog answered HTTP {s}"))),
+        }
+    }
+
     /// Tells the server to revoke this device. Best effort: sign-out clears
     /// the local credential whatever the answer.
     pub async fn revoke(&self, credential: &str) -> Result<(), ApiError> {
@@ -646,6 +700,65 @@ mod tests {
         assert_eq!(t.lifetime, Duration::from_secs(3600));
         assert_eq!(t.relay_url.as_deref(), Some("wss://r"));
         assert!(parse_ticket(r#"{"ticket":""}"#, 0, r).is_err());
+    }
+
+    #[test]
+    fn ticket_features_techlog_defaults_to_false() {
+        let r = Instant::now();
+        let t = |body: &str| parse_ticket(body, 0, r).unwrap().techlog;
+        assert!(!t(r#"{"ticket":"opaque"}"#), "missing features");
+        assert!(!t(r#"{"ticket":"opaque","features":{}}"#));
+        assert!(!t(r#"{"ticket":"opaque","features":{"techlog":"yes"}}"#));
+        assert!(!t(r#"{"ticket":"opaque","features":null}"#));
+        assert!(!t(r#"{"ticket":"opaque","features":{"techlog":false}}"#));
+        assert!(t(r#"{"ticket":"opaque","features":{"techlog":true}}"#));
+    }
+
+    #[tokio::test]
+    async fn post_techlog_answers() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        type Check = fn(&Result<(), ApiError>) -> bool;
+        let cases: Vec<(ResponseTemplate, Check)> = vec![
+            (ResponseTemplate::new(204), |r| r.is_ok()),
+            (
+                ResponseTemplate::new(401).set_body_json(serde_json::json!({ "error": "revoked" })),
+                |r| matches!(r, Err(ApiError::Unauthorized)),
+            ),
+            (
+                ResponseTemplate::new(422)
+                    .set_body_json(serde_json::json!({ "error": "invalid_body", "path": "snap.items" })),
+                |r| matches!(r, Err(ApiError::InvalidBody { path }) if path == "snap.items"),
+            ),
+            (ResponseTemplate::new(429).insert_header("retry-after", "30"), |r| {
+                let ra = Some(Duration::from_secs(30));
+                matches!(r, Err(e @ ApiError::RateLimited { .. }) if e.retry_after() == ra)
+            }),
+            (
+                ResponseTemplate::new(503).set_body_json(serde_json::json!({ "error": "disabled" })),
+                |r| matches!(r, Err(ApiError::Disabled)),
+            ),
+            (
+                ResponseTemplate::new(503).set_body_json(serde_json::json!({ "error": "unavailable" })),
+                |r| matches!(r, Err(ApiError::Unavailable { .. })),
+            ),
+        ];
+        for (i, (resp, ok)) in cases.into_iter().enumerate() {
+            let s = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(TECHLOG_PATH))
+                .and(header("authorization", "Bearer snc_1"))
+                .and(header("x-connector-version", env!("CARGO_PKG_VERSION")))
+                .respond_with(resp)
+                .expect(1)
+                .mount(&s)
+                .await;
+            let body = serde_json::json!({ "health": { "code": "OK" } });
+            let r = ApiClient::new(&s.uri()).post_techlog("snc_1", &body).await;
+            assert!(ok(&r), "case {i}: {r:?}");
+            let sent = &s.received_requests().await.unwrap()[0];
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&sent.body).unwrap(), body);
+        }
     }
 
     #[test]

@@ -68,23 +68,6 @@ pub struct Item {
     pub performance_note: Option<String>,
 }
 
-/// The fields the hash covers: the snapshot without `hash` and `readAt`.
-/// The field order is fixed, which makes the JSON canonical enough.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Hashed<'a> {
-    v: u8,
-    techlog_version: &'a str,
-    loaded: bool,
-    sim_registration: &'a Option<String>,
-    airframe: &'a Airframe,
-    dispatch: DispatchStatus,
-    reasons: &'a [String],
-    items: &'a [Item],
-    fuel_factor_pct: Option<f64>,
-    sim_brief_factor: &'a Option<String>,
-}
-
 /// Builds the snapshot from TechLog's state. None when TechLog has no airframe.
 pub fn build(state: &State, techlog_version: &str, read_at: DateTime<Utc>) -> Option<Snapshot> {
     let af = state.airframe.as_ref()?;
@@ -144,19 +127,11 @@ pub fn build(state: &State, techlog_version: &str, read_at: DateTime<Utc>) -> Op
 /// SHA-256 hex over the snapshot without `hash` and `readAt`, so a re-read of
 /// unchanged TechLog state gives the same hash.
 pub fn hash(s: &Snapshot) -> String {
-    let hashed = Hashed {
-        v: s.v,
-        techlog_version: &s.techlog_version,
-        loaded: s.loaded,
-        sim_registration: &s.sim_registration,
-        airframe: &s.airframe,
-        dispatch: s.dispatch,
-        reasons: &s.reasons,
-        items: &s.items,
-        fuel_factor_pct: s.fuel_factor_pct,
-        sim_brief_factor: &s.sim_brief_factor,
-    };
-    let json = serde_json::to_vec(&hashed).expect("snapshot serialises");
+    let mut value = serde_json::to_value(s).expect("snapshot serialises");
+    let fields = value.as_object_mut().expect("snapshot is an object");
+    fields.remove("hash");
+    fields.remove("readAt");
+    let json = serde_json::to_vec(&value).expect("snapshot serialises");
     hex::encode(Sha256::digest(&json))
 }
 
@@ -237,6 +212,24 @@ mod tests {
         assert_eq!(a.hash.len(), 64);
         assert!(a.hash.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
         assert_eq!(hash(&a), a.hash);
+    }
+
+    #[test]
+    fn hash_ignores_only_hash_and_read_at() {
+        let a = build(&go_mel(), "2.1.2", at(0)).unwrap();
+        let mut b = a.clone();
+        b.hash = "x".into();
+        b.read_at = "y".into();
+        assert_eq!(hash(&b), a.hash);
+        let mut c = a.clone();
+        c.loaded = !c.loaded;
+        assert_ne!(hash(&c), a.hash);
+        let mut d = a.clone();
+        d.sim_brief_factor = None;
+        assert_ne!(hash(&d), a.hash);
+        let mut e = a.clone();
+        e.techlog_version = "2.1.3".into();
+        assert_ne!(hash(&e), a.hash);
     }
 
     #[test]

@@ -4,6 +4,10 @@
 //! snapshot needs are modelled; every other key is ignored, so TechLog can add
 //! fields without breaking us. Any TechLog double may be `null` (NaN and
 //! Infinity are written as `null`), so doubles are `Option<f64>`.
+//!
+//! Because TechLog writes every key, a nullable field in `State` is required
+//! but may be null (`nullable`): a missing or renamed key is a schema error,
+//! not a silent null. `Ping` is the exception, its keys really are optional.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +31,7 @@ pub struct State {
     pub sim: Sim,
     /// Null when TechLog has no airframe. Not null does not mean the aircraft
     /// is in the sim: TechLog restores the last airframe at startup.
+    #[serde(deserialize_with = "nullable")]
     pub airframe: Option<Airframe>,
     pub dispatch: Dispatch,
     /// Open and deferred defects only.
@@ -37,6 +42,7 @@ pub struct State {
 #[serde(rename_all = "camelCase")]
 pub struct Sim {
     /// Registration of the aircraft identified in the sim; null when none.
+    #[serde(deserialize_with = "nullable")]
     pub registration: Option<String>,
 }
 
@@ -45,9 +51,13 @@ pub struct Sim {
 pub struct Airframe {
     pub registration: String,
     pub family: String,
+    #[serde(deserialize_with = "nullable")]
     pub family_label: Option<String>,
+    #[serde(deserialize_with = "nullable")]
     pub variant: Option<String>,
+    #[serde(deserialize_with = "nullable")]
     pub engine: Option<String>,
+    #[serde(deserialize_with = "nullable")]
     pub performance: Option<Perf>,
 }
 
@@ -55,8 +65,10 @@ pub struct Airframe {
 #[serde(rename_all = "camelCase")]
 pub struct Perf {
     /// Total fuel burn penalty in percent, one decimal.
+    #[serde(deserialize_with = "nullable")]
     pub fuel_factor_pct: Option<f64>,
     /// SimBrief perf code such as `"P02"` or `"M01"`.
+    #[serde(deserialize_with = "nullable")]
     pub sim_brief: Option<String>,
 }
 
@@ -83,23 +95,45 @@ pub enum DispatchStatus {
 #[serde(rename_all = "camelCase")]
 pub struct Defect {
     pub id: i64,
+    #[serde(deserialize_with = "nullable")]
     pub mel_id: Option<String>,
+    #[serde(deserialize_with = "nullable")]
     pub ata: Option<i64>,
     pub title: String,
     /// `"A"`..`"D"` or `"NO-GO"`; anything else is dropped to null in the snapshot.
+    #[serde(deserialize_with = "nullable")]
     pub category: Option<String>,
     /// PascalCase: `"Open"`, `"Deferred"`.
     pub status: String,
+    #[serde(deserialize_with = "nullable")]
     pub raised_utc: Option<String>,
     /// Local date `yyyy-MM-dd`.
+    #[serde(deserialize_with = "nullable")]
     pub deferred_until: Option<String>,
+    #[serde(deserialize_with = "nullable")]
     pub placard: Option<String>,
+    #[serde(deserialize_with = "nullable")]
     pub restrictions: Option<String>,
+    #[serde(deserialize_with = "nullable")]
     pub ops: Option<String>,
+    #[serde(deserialize_with = "nullable")]
     pub position: Option<String>,
+    #[serde(deserialize_with = "nullable")]
     pub label: Option<String>,
+    #[serde(deserialize_with = "nullable")]
     pub performance_note: Option<String>,
+    #[serde(deserialize_with = "nullable")]
     pub rectified_utc: Option<String>,
+}
+
+/// A key that must be present but may be null. serde reads a missing
+/// `Option` field as None; with `deserialize_with` it reports the missing field.
+fn nullable<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(d)
 }
 
 /// TechLog's JSON did not have the shape we expect. `path` is the JSON path
@@ -210,6 +244,41 @@ pub(crate) mod tests {
             v["airframe"].as_object_mut().unwrap().remove("registration");
         });
         assert_eq!(parse_state(&body).unwrap_err().path, "airframe.registration");
+    }
+
+    #[test]
+    fn missing_airframe_key_is_not_read_as_no_airframe() {
+        let body = edit("state-fenix-go-mel.json", |v| {
+            v.as_object_mut().unwrap().remove("airframe");
+        });
+        assert_eq!(parse_state(&body).unwrap_err().path, "airframe");
+    }
+
+    #[test]
+    fn missing_nullable_defect_key_is_a_schema_error() {
+        let body = edit("state-fenix-go-mel.json", |v| {
+            v["defects"][0].as_object_mut().unwrap().remove("rectifiedUtc");
+        });
+        let path = parse_state(&body).unwrap_err().path;
+        assert_eq!(path, "defects[0].rectifiedUtc");
+    }
+
+    #[test]
+    fn missing_sim_registration_is_a_schema_error() {
+        let body = edit("state-fenix-go-mel.json", |v| {
+            v["sim"].as_object_mut().unwrap().remove("registration");
+        });
+        assert_eq!(parse_state(&body).unwrap_err().path, "sim.registration");
+    }
+
+    #[test]
+    fn missing_fuel_factor_is_a_schema_error() {
+        let body = edit("state-fenix-go-mel.json", |v| {
+            let perf = v["airframe"]["performance"].as_object_mut().unwrap();
+            perf.remove("fuelFactorPct");
+        });
+        let path = parse_state(&body).unwrap_err().path;
+        assert_eq!(path, "airframe.performance.fuelFactorPct");
     }
 
     #[test]

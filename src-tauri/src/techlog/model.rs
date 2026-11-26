@@ -137,7 +137,8 @@ where
 }
 
 /// TechLog's JSON did not have the shape we expect. `path` is the JSON path
-/// of the first problem, such as `dispatch` or `defects[0].title`.
+/// of the first problem, such as `dispatch` or `defects[].title` (array indices are dropped so the
+/// same problem on any item reports one path).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("TechLog state does not match the expected schema at {path}")]
 pub struct SchemaError {
@@ -151,9 +152,9 @@ pub fn parse_state(body: &str) -> Result<State, SchemaError> {
 }
 
 /// The error's path, with the field name added for a missing field (serde
-/// reports those at the enclosing object).
+/// reports those at the enclosing object) and array indices written as `[]`.
 fn error_path(e: &serde_path_to_error::Error<serde_json::Error>) -> String {
-    let base = e.path().to_string();
+    let base = without_indices(&e.path().to_string());
     let base = if base == "." { String::new() } else { base };
     let message = e.inner().to_string();
     let missing = message
@@ -166,6 +167,24 @@ fn error_path(e: &serde_path_to_error::Error<serde_json::Error>) -> String {
         None if base.is_empty() => ".".to_string(),
         None => base,
     }
+}
+
+/// `defects[3].title` as `defects[].title`: only all-digit brackets are emptied.
+fn without_indices(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut rest = path;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..=open]);
+        rest = &rest[open + 1..];
+        if let Some(close) = rest.find(']') {
+            let inside = &rest[..close];
+            if !inside.is_empty() && inside.bytes().all(|b| b.is_ascii_digit()) {
+                rest = &rest[close..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -234,8 +253,24 @@ pub(crate) mod tests {
             d.insert("name".into(), title);
         });
         let path = parse_state(&body).unwrap_err().path;
-        assert!(path.starts_with("defects[0]"), "{path}");
-        assert_eq!(path, "defects[0].title");
+        assert_eq!(path, "defects[].title");
+    }
+
+    #[test]
+    fn a_later_defect_reports_the_same_path() {
+        let body = edit("state-fenix-go-mel.json", |v| {
+            v["defects"][1].as_object_mut().unwrap().remove("title");
+        });
+        assert_eq!(parse_state(&body).unwrap_err().path, "defects[].title");
+    }
+
+    #[test]
+    fn without_indices_empties_only_numbers() {
+        assert_eq!(without_indices("defects[3].title"), "defects[].title");
+        assert_eq!(without_indices("a[12].b[0]"), "a[].b[]");
+        assert_eq!(without_indices("a[x].b"), "a[x].b");
+        assert_eq!(without_indices("a[]"), "a[]");
+        assert_eq!(without_indices("dispatch"), "dispatch");
     }
 
     #[test]
@@ -260,7 +295,7 @@ pub(crate) mod tests {
             v["defects"][0].as_object_mut().unwrap().remove("rectifiedUtc");
         });
         let path = parse_state(&body).unwrap_err().path;
-        assert_eq!(path, "defects[0].rectifiedUtc");
+        assert_eq!(path, "defects[].rectifiedUtc");
     }
 
     #[test]

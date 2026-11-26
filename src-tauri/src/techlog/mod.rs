@@ -3,9 +3,11 @@
 //!
 //! Layout: `model` (the parts of TechLog's JSON we read), `snapshot` (our own
 //! wire object and its hash), `client` (the local reads), `runner` (cadence,
-//! change detection and the POST to SkyNexus).
+//! change detection and the POST to SkyNexus), `setting` (the tray switch
+//! kept on disk).
 
 pub mod client;
 pub mod model;
 pub mod runner;
+pub mod setting;
 pub mod snapshot;

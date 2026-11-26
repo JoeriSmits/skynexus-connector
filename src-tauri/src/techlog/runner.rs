@@ -192,7 +192,8 @@ pub async fn run(
     let mut refused: Option<String> = None;
     // 503 `disabled`: wait for the next ticket.
     let mut server_off = false;
-    let mut post_failing = false;
+    // The kind of retryable post error already logged in this streak.
+    let mut post_failing: Option<std::mem::Discriminant<ApiError>> = None;
     loop {
         let credential = cfg.credential.borrow_and_update().clone();
         let feature = *cfg.features.borrow_and_update();
@@ -238,9 +239,17 @@ pub async fn run(
         if tracker.due(&code, hash.as_deref(), now, timing.keepalive) {
             let (b, sent_hash) = body(health(&code, version.as_deref()), snap);
             let result = api.post_techlog(&credential, &b).await;
-            // Any answer from SkyNexus ends a "cannot reach" streak.
-            if !matches!(result, Err(ApiError::Network(_))) {
-                post_failing = false;
+            // A success, or an error that is not retried, ends the streak.
+            if !matches!(
+                result,
+                Err(ApiError::Network(_)
+                    | ApiError::NotEnabled
+                    | ApiError::RateLimited { .. }
+                    | ApiError::NotConfigured { .. }
+                    | ApiError::Unavailable { .. }
+                    | ApiError::Protocol(_))
+            ) {
+                post_failing = None;
             }
             match result {
                 Ok(()) => {
@@ -263,13 +272,15 @@ pub async fn run(
                     cfg.features.borrow_and_update();
                 }
                 Err(e) => {
-                    if matches!(e, ApiError::Network(_)) {
-                        if !post_failing {
+                    // Once per streak of the same kind, not on every retry.
+                    let kind = std::mem::discriminant(&e);
+                    if post_failing != Some(kind) {
+                        if matches!(e, ApiError::Network(_)) {
                             log::warn!("techlog: cannot reach SkyNexus ({e}); retrying");
-                            post_failing = true;
+                        } else {
+                            log::info!("techlog: SkyNexus answered: {e}; retrying");
                         }
-                    } else {
-                        log::info!("techlog: SkyNexus answered: {e}; retrying");
+                        post_failing = Some(kind);
                     }
                     wait = wait.max(e.retry_after().unwrap_or_default().min(MAX_RETRY_AFTER));
                 }
@@ -577,7 +588,7 @@ mod tests {
     async fn an_invalid_body_is_not_resent() {
         let tl = techlog().await;
         let first = ResponseTemplate::new(200).set_body_string(fixture(STATE));
-        mount_techlog(&tl, first, Some(20), 1).await;
+        mount_techlog(&tl, first, Some(40), 1).await;
         let later = ResponseTemplate::new(200).set_body_string(changed_state());
         mount_techlog(&tl, later, None, 5).await;
         let invalid = json!({ "error": "invalid_body", "path": "snapshot.dispatch" });

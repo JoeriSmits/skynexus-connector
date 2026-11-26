@@ -104,12 +104,12 @@ impl TechlogClient {
 
     async fn ping(&self) -> Result<Ping, Code> {
         let url = self.base.join("api/ping").expect("ping url");
-        let resp = self.http.get(url).send().await.map_err(transport_code)?;
+        let resp = self.http.get(url).send().await.map_err(ping_transport_code)?;
         let status = resp.status();
         if !status.is_success() {
             return Err(Code::Http(status.as_u16()));
         }
-        let body = resp.text().await.map_err(transport_code)?;
+        let body = resp.text().await.map_err(ping_transport_code)?;
         let ping: Ping = serde_json::from_str(&body).map_err(|_| Code::NotTechlog)?;
         if ping.engine == Some(false) {
             return Err(Code::Starting);
@@ -135,14 +135,19 @@ impl TechlogClient {
     }
 }
 
-/// A transport failure. Any failure while connecting (refused, unreachable,
-/// connect timeout) means TechLog is not running: Windows only reports a
-/// refused localhost port after ~2 s, which looks like a timeout. Only a
-/// timeout after the connection was made is a real `Timeout`.
+/// A transport failure during the `/api/ping` step. A timeout or a connect
+/// error both map to `NotRunning`: we cannot tell a hung ping from a closed
+/// app (Windows only reports a refused localhost port after ~2 s, which looks
+/// like a total-request timeout), and `NotRunning` is not an alarm code.
+fn ping_transport_code(_e: reqwest::Error) -> Code {
+    Code::NotRunning
+}
+
+/// A transport failure during the `/api/state` step. TechLog already answered
+/// the ping, so a timeout here is a real `Timeout`; anything else that is not
+/// a timeout or connect error is `NotRunning` too.
 fn transport_code(e: reqwest::Error) -> Code {
-    if e.is_connect() {
-        Code::NotRunning
-    } else if e.is_timeout() {
+    if !e.is_connect() && e.is_timeout() {
         Code::Timeout
     } else {
         Code::NotRunning
@@ -276,7 +281,7 @@ mod tests {
     async fn ping_timeout() {
         let s = MockServer::start().await;
         mock(&s, "/api/ping", ping_ok().set_delay(Duration::from_secs(2))).await;
-        assert_eq!(client(&s).read().await.0, Code::Timeout);
+        assert_eq!(client(&s).read().await.0, Code::NotRunning);
     }
 
     #[tokio::test]

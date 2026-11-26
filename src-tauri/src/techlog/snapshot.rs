@@ -71,12 +71,7 @@ pub struct Item {
 /// Builds the snapshot from TechLog's state. None when TechLog has no airframe.
 pub fn build(state: &State, techlog_version: &str, read_at: DateTime<Utc>) -> Option<Snapshot> {
     let af = state.airframe.as_ref()?;
-    let loaded = state
-        .sim
-        .registration
-        .as_deref()
-        .map(normalise_registration)
-        .is_some_and(|sim| !sim.is_empty() && sim == normalise_registration(&af.registration));
+    let loaded = is_loaded(&state.sim, af);
     let items = state
         .defects
         .iter()
@@ -141,6 +136,23 @@ pub fn short(hash: &str) -> String {
 }
 
 /// Uppercase, without `-`, spaces and `.`, so `ph-eza` matches `PH-EZA`.
+/// TechLog switches its airframe when an aircraft is loaded, but the airframe
+/// registration can differ from the livery's ATC ID (Fenix), so the family is
+/// the primary signal. Registration is only the fallback when the family is unknown.
+fn is_loaded(sim: &crate::techlog::model::Sim, af: &crate::techlog::model::Airframe) -> bool {
+    if !sim.connected {
+        return false;
+    }
+    match sim.family.as_deref() {
+        Some(family) => family == af.family,
+        None => sim
+            .registration
+            .as_deref()
+            .map(normalise_registration)
+            .is_some_and(|r| !r.is_empty() && r == normalise_registration(&af.registration)),
+    }
+}
+
 fn normalise_registration(reg: &str) -> String {
     reg.chars()
         .filter(|c| !matches!(c, '-' | ' ' | '.'))
@@ -178,6 +190,34 @@ mod tests {
     fn other_aircraft_in_the_sim_is_not_loaded() {
         let mut state = go_mel();
         state.sim.registration = Some("PH-BXA".into());
+        state.sim.family = Some("pmdg737".into());
+        assert!(!build(&state, "2.1.2", at(0)).unwrap().loaded);
+    }
+
+    #[test]
+    fn fenix_livery_atc_id_differs_from_airframe_registration_but_is_loaded() {
+        let mut state = go_mel();
+        state.airframe.as_mut().unwrap().registration = "PH-SNX".into();
+        state.sim.registration = Some("G-EZRY".into());
+        state.sim.family = Some("fenix-a32x".into());
+        let s = build(&state, "2.1.2", at(0)).unwrap();
+        assert!(s.loaded);
+        assert_eq!(s.sim_registration.as_deref(), Some("G-EZRY"));
+    }
+
+    #[test]
+    fn sim_not_connected_is_not_loaded() {
+        let mut state = go_mel();
+        state.sim.connected = false;
+        assert!(!build(&state, "2.1.2", at(0)).unwrap().loaded);
+    }
+
+    #[test]
+    fn unknown_sim_family_falls_back_to_registration() {
+        let mut state = go_mel();
+        state.sim.family = None;
+        assert!(build(&state, "2.1.2", at(0)).unwrap().loaded);
+        state.sim.registration = Some("G-EZRY".into());
         assert!(!build(&state, "2.1.2", at(0)).unwrap().loaded);
     }
 
@@ -185,6 +225,7 @@ mod tests {
     fn no_sim_aircraft_is_not_loaded() {
         let mut state = go_mel();
         state.sim.registration = None;
+        state.sim.family = None;
         let s = build(&state, "2.1.2", at(0)).unwrap();
         assert!(!s.loaded);
         assert_eq!(s.sim_registration, None);

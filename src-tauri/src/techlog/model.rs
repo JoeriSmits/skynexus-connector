@@ -41,6 +41,11 @@ pub struct State {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Sim {
+    /// SimConnect is connected.
+    pub connected: bool,
+    /// Family id of the aircraft identified in the sim; null until identified.
+    #[serde(deserialize_with = "nullable")]
+    pub family: Option<String>,
     /// Registration of the aircraft identified in the sim; null when none.
     #[serde(deserialize_with = "nullable")]
     pub registration: Option<String>,
@@ -304,6 +309,14 @@ pub(crate) mod tests {
             v["sim"].as_object_mut().unwrap().remove("registration");
         });
         assert_eq!(parse_state(&body).unwrap_err().path, "sim.registration");
+    }
+
+    #[test]
+    fn missing_sim_family_is_a_schema_error() {
+        let body = edit("state-fenix-go-mel.json", |v| {
+            v["sim"].as_object_mut().unwrap().remove("family");
+        });
+        assert_eq!(parse_state(&body).unwrap_err().path, "sim.family");
     }
 
     #[test]

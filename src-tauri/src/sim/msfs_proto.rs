@@ -273,6 +273,7 @@ pub fn decode_own(d: &[u8]) -> Option<Own> {
         on_ground: v(7)? >= 0.5,
         fuel_kg: Some(v(9)? * LB_TO_KG),
         callsign: str_at(d, 10 * 8, 32),
+        tl: None,
     })
 }
 

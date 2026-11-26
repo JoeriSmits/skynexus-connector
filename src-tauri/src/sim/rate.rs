@@ -91,6 +91,7 @@ mod tests {
             on_ground,
             fuel_kg: None,
             callsign: None,
+            tl: None,
         }
     }
 

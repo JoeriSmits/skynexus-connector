@@ -1,5 +1,5 @@
 //! The engine ties the parts together and owns their lifetimes: the sim
-//! driver thread, the pairing task and the relay task. The tray and the
+//! driver thread, the pairing task, the relay task and the TechLog runner. The tray and the
 //! headless mode are both thin shells around it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +15,8 @@ use crate::frame::{Frame, SimKind};
 use crate::pairing::{self, PairEvent, PollTiming};
 use crate::relay::{FrameSlot, Relay, RelayExit, RelayState, RelayTiming};
 use crate::sim::{self, SimState, Source};
+use crate::techlog::client::{TechlogClient, DEFAULT_BASE};
+use crate::techlog::runner::{self, RunnerCfg, RunnerTiming};
 use crate::ticket::TicketManager;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,6 +103,7 @@ impl Status {
 struct Tasks {
     pairing: Option<JoinHandle<()>>,
     relay: Option<JoinHandle<()>>,
+    techlog: Option<JoinHandle<()>>,
     sim: Option<std::thread::JoinHandle<()>>,
     /// Signals when the sign-out revoke finished, so Quit can wait for it.
     revoke_done: Option<std::sync::mpsc::Receiver<()>>,
@@ -122,6 +125,15 @@ pub struct Engine {
     /// The credential in use, kept for sign-out's revoke even if the
     /// keychain cannot be read back then.
     credential: Mutex<Option<Credential>>,
+    /// The credential for the TechLog runner; None while signed out.
+    credential_tx: watch::Sender<Option<String>>,
+    /// `features.techlog` of every ticket the relay fetches.
+    techlog_features: watch::Sender<bool>,
+    /// The "Read TechLog" switch; off until the tray turns it on.
+    read_techlog: watch::Sender<bool>,
+    /// The short hash of the TechLog snapshot SkyNexus last accepted, put on
+    /// every own-ship frame.
+    tl: watch::Sender<Option<String>>,
 }
 
 impl Engine {
@@ -150,6 +162,10 @@ impl Engine {
             tasks: Mutex::default(),
             stop: Arc::new(AtomicBool::new(false)),
             credential: Mutex::new(None),
+            credential_tx: watch::channel(None).0,
+            techlog_features: watch::channel(false).0,
+            read_techlog: watch::channel(false).0,
+            tl: watch::channel(None).0,
         })
     }
 
@@ -169,6 +185,24 @@ impl Engine {
         self.status.send_modify(|s| s.auth = auth);
     }
 
+    /// Turns reading TechLog on or off (the tray's "Read TechLog").
+    pub fn set_read_techlog(&self, on: bool) {
+        self.read_techlog.send_if_modified(|cur| {
+            let changed = *cur != on;
+            *cur = on;
+            changed
+        });
+    }
+
+    /// The credential for the TechLog runner. Signing out also forgets the
+    /// last ticket's `features.techlog`, so another account waits for its own.
+    fn set_credential(&self, c: Option<&Credential>) {
+        if c.is_none() {
+            self.techlog_features.send_replace(false);
+        }
+        self.credential_tx.send_replace(c.map(|c| c.credential.clone()));
+    }
+
     /// Starts the sim driver and, with a stored credential, the relay.
     pub fn start(self: &Arc<Self>) {
         self.start_sim();
@@ -176,6 +210,7 @@ impl Engine {
         if self.cfg.offline {
             return;
         }
+        self.start_techlog();
         match self.store.load() {
             Ok(Some(c)) => {
                 self.set_auth(Auth::SignedIn);
@@ -206,6 +241,7 @@ impl Engine {
         let stop = self.stop.clone();
         let print = self.cfg.print_frames;
         let offline = self.cfg.offline;
+        let tl = self.tl.subscribe();
         let handle = std::thread::Builder::new()
             .name("sim-driver".into())
             .spawn(move || {
@@ -214,7 +250,7 @@ impl Engine {
                     interval,
                     &stop,
                     |f: &Frame, hz: u32| {
-                        let json = f.to_json();
+                        let json = f.to_json_with_tl(tl.borrow().as_deref());
                         if print {
                             println!("{json}");
                         }
@@ -260,12 +296,34 @@ impl Engine {
         });
     }
 
+    /// Starts the TechLog runner. It reads nothing until the switch is on,
+    /// a credential is there and a ticket allowed it.
+    fn start_techlog(self: &Arc<Self>) {
+        let cfg = RunnerCfg {
+            credential: self.credential_tx.subscribe(),
+            features: self.techlog_features.subscribe(),
+            timing: RunnerTiming::default(),
+        };
+        let client = TechlogClient::new(url::Url::parse(DEFAULT_BASE).expect("TechLog URL"));
+        let task = self.rt.spawn(runner::run(
+            cfg,
+            client,
+            self.api.clone(),
+            self.tl.clone(),
+            self.read_techlog.subscribe(),
+        ));
+        if let Some(old) = self.tasks.lock().unwrap().techlog.replace(task) {
+            old.abort();
+        }
+    }
+
     fn start_relay(self: &Arc<Self>, c: Credential) {
         *self.credential.lock().unwrap() = Some(c.clone());
+        self.set_credential(Some(&c));
         let me = self.clone();
         let relay = Relay {
             cfg: self.cfg.clone(),
-            tickets: TicketManager::new(self.api.clone(), c.credential),
+            tickets: TicketManager::new(self.api.clone(), c.credential).with_features(self.techlog_features.clone()),
             frames: self.frames.subscribe(),
             state: self.relay_state.clone(),
             timing: RelayTiming::default(),
@@ -275,6 +333,7 @@ impl Engine {
                 RelayExit::Unauthorized => {
                     log::warn!("the credential was refused; signing out");
                     me.credential.lock().unwrap().take();
+                    me.set_credential(None);
                     if let Err(e) = me.store.clear() {
                         log::warn!("keychain: {e}");
                     }
@@ -368,6 +427,7 @@ impl Engine {
             .unwrap()
             .take()
             .or_else(|| self.store.load().ok().flatten());
+        self.set_credential(None);
         if let Err(e) = self.store.clear() {
             log::warn!("keychain: {e}");
         }
@@ -389,7 +449,10 @@ impl Engine {
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Relaxed);
         let mut t = self.tasks.lock().unwrap();
-        for task in [t.pairing.take(), t.relay.take()].into_iter().flatten() {
+        for task in [t.pairing.take(), t.relay.take(), t.techlog.take()]
+            .into_iter()
+            .flatten()
+        {
             task.abort();
         }
         let revoke = t.revoke_done.take();
@@ -502,6 +565,7 @@ mod tests {
             on_ground: true,
             fuel_kg: None,
             callsign: None,
+            tl: None,
         };
         let lines: Vec<String> = (0..3)
             .map(|i| Frame::new(SimKind::Replay, i * 100, own.clone()).to_json())
@@ -553,6 +617,27 @@ mod tests {
     }
 
     #[test]
+    fn frames_carry_the_techlog_hash_once_there_is_one() {
+        let own = Own {
+            lat: 50.0,
+            lon: 8.5,
+            alt_ft: 364.0,
+            gs_kt: 0.0,
+            hdg: 249.0,
+            trk: 249.0,
+            vs_fpm: 0.0,
+            on_ground: true,
+            fuel_kg: None,
+            callsign: None,
+            tl: None,
+        };
+        let f = Frame::new(SimKind::Msfs, 1, own);
+        assert!(!f.to_json_with_tl(None).contains("\"tl\""));
+        let json = f.to_json_with_tl(Some("0123456789ab"));
+        assert!(json.contains(r#""tl":"0123456789ab""#), "{json}");
+    }
+
+    #[test]
     fn sign_out_revokes_with_the_kept_credential_and_quit_waits_for_it() {
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -590,7 +675,13 @@ mod tests {
             credential: "snc_kept".into(),
             device_id: None,
         });
+        engine.techlog_features.send_replace(true);
         engine.sign_out();
+        assert!(
+            !*engine.techlog_features.borrow(),
+            "a new account waits for its own ticket"
+        );
+        assert_eq!(*engine.credential_tx.borrow(), None);
         let started = std::time::Instant::now();
         engine.shutdown();
         let waited = started.elapsed();

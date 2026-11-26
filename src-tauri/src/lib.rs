@@ -4,7 +4,7 @@
 //! Layout: `frame` (wire schema), `api` (web app routes), `pairing`,
 //! `credentials`, `ticket`, `relay`, `sim` (adapters and pacing), `engine`
 //! (lifetimes), `tray` (UI), `config` (flags), `msfs_launch` (start and stop
-//! with MSFS), `logs` (the log file).
+//! with MSFS), `logs` (the log file), `techlog` (the TechLog link).
 
 pub mod api;
 pub mod config;
@@ -16,6 +16,7 @@ pub mod msfs_launch;
 pub mod pairing;
 pub mod relay;
 pub mod sim;
+pub mod techlog;
 pub mod ticket;
 mod tray;
 
@@ -204,6 +205,12 @@ fn run_tray(rt: &tokio::runtime::Runtime, engine: Arc<Engine>) {
             app.manage(setup_engine.clone());
             let entry = msfs_entry(app, setup_engine.config());
             let msfs_on = entry.as_ref().map(|(dir, exe)| msfs_launch::apply(dir, exe));
+            // The saved "Read TechLog" choice must be in place before the first read.
+            let techlog_on = app
+                .path()
+                .app_config_dir()
+                .is_ok_and(|dir| techlog::setting::is_on(&dir));
+            setup_engine.set_read_techlog(techlog_on);
             tray::build(app, setup_engine.clone(), entry.zip(msfs_on))?;
             setup_engine.start();
             tauri::async_runtime::spawn(log_status(setup_engine.clone()));

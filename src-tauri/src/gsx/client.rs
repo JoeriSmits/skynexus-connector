@@ -211,7 +211,7 @@ mod tests {
             let b = text(&mut ws).await;
             assert_eq!(a["type"], "subscribe");
             assert_eq!(b["verb"], "state.get");
-            ws.send(Message::text(r#"{"type":"snapshot","state":{}}"#))
+            ws.send(Message::text(r#"{"type":"snapshot","state":3}"#))
                 .await
                 .unwrap();
             let _ = ws.next().await;

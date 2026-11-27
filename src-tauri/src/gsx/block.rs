@@ -305,10 +305,11 @@ mod tests {
         let mut st = GsxState::default();
         let pk: Vec<Value> = parkings.iter().map(|n| json!({"uiGateName": n})).collect();
         st.apply(&json!({"type":"hello","protocol":2,"engine":"4.0.6"}));
-        st.apply(&json!({"type":"snapshot","state":{
-            "airport":{"icao":"EHAM","parkings":pk},
-            "parking":{"uiGateName":"Gate D4","uiType":"Gate"},
-            "services":services}}));
+        st.apply(&json!({"type":"snapshot","state":3,
+            "handlerData":{
+                "airport":{"icao":"EHAM","parkings":pk},
+                "gate":{"uiName":"","uiGateName":"Gate D4","uiType":"Gate"}},
+            "services":services}));
         st
     }
 
@@ -428,7 +429,8 @@ mod tests {
     #[test]
     fn a_bad_airport_is_left_out() {
         let mut st = GsxState::default();
-        st.apply(&json!({"type":"snapshot","state":{"airport":{"icao":"AMS"}}}));
+        st.apply(&json!({"type":"snapshot","state":3,
+            "handlerData":{"airport":{"icao":"AMS"}}}));
         assert_eq!(block(&st, &SimExtras::default(), None).apt, None);
         assert_eq!(parkings(&st), None);
     }

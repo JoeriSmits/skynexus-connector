@@ -1,7 +1,8 @@
 //! The merged GSX state: snapshot plus patches from the Remote API.
-//! Lenient by design: the patch paths are not verified against a real
-//! capture, so unknown types and keys are ignored and a malformed message
-//! never panics or clears good state.
+//! Shapes follow the reference client (Any2GSX): a snapshot carries its
+//! payloads as top-level keys next to a numeric `state`, a patch replaces
+//! one whole top-level payload. Lenient by design: unknown types and keys
+//! are ignored and a malformed message never panics or clears good state.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -16,11 +17,13 @@ pub struct ServiceView {
     pub progress: String,
 }
 
-/// Top-level keys of the normalised tree and the JSON type each must have.
+/// Top-level payloads and the JSON type each must have. A message that
+/// carries the wrong type for its key is ignored, never stored.
 fn key_ok(key: &str, v: &Value) -> bool {
     match key {
         "services" => v.is_array(),
-        "airport" | "aircraft" | "parking" | "menu" | "simbrief" => v.is_object() || v.is_null(),
+        "state" => v.is_number(),
+        "handlerData" | "menu" | "settings" => v.is_object() || v.is_null(),
         _ => true,
     }
 }
@@ -67,14 +70,17 @@ fn set_path(root: &mut Value, segs: &[String], value: Value) {
     }
 }
 
+/// Envelope keys of a snapshot message that are not payloads.
+const ENVELOPE: [&str; 3] = ["v", "type", "ts"];
+
 /// Merged state of one GSX session. A `hello` starts a new session and
 /// calls `reset`, so a reconnect never keeps the old services as live.
 /// The supervisor should also call `reset` when the socket drops.
 #[derive(Debug, Default)]
 pub struct GsxState {
     version: Option<String>,
-    /// Snapshot state with `handlerData` flattened into the root, so a patch
-    /// to `/airport` and one to `/handlerData/airport` land in the same place.
+    /// The snapshot's top-level payloads (`handlerData`, `services`, ...)
+    /// keyed by name, as GSX sends them.
     root: Value,
 }
 
@@ -88,12 +94,7 @@ impl GsxState {
                     self.version = Some(e.to_string());
                 }
             }
-            Some("snapshot") => {
-                if let Some(Value::Object(state)) = msg.get("state") {
-                    self.root = Value::Object(Default::default());
-                    self.merge_object(state);
-                }
-            }
+            Some("snapshot") => self.snapshot(msg),
             Some("patch") => self.patch(msg),
             // Results are the client's business; events carry nothing we show.
             _ => {}
@@ -106,16 +107,22 @@ impl GsxState {
         self.version = None;
     }
 
-    fn merge_object(&mut self, obj: &serde_json::Map<String, Value>) {
+    /// The payloads are top-level keys of the message. Like the reference
+    /// client, only a snapshot whose `state` is a number counts.
+    fn snapshot(&mut self, msg: &Value) {
+        let Some(obj) = msg.as_object() else {
+            return;
+        };
+        if !obj.get("state").is_some_and(Value::is_number) {
+            return;
+        }
+        let mut root = serde_json::Map::new();
         for (k, v) in obj {
-            if k == "handlerData" {
-                if let Value::Object(h) = v {
-                    self.merge_object(h);
-                }
-            } else if key_ok(k, v) {
-                self.set(std::slice::from_ref(k), v.clone());
+            if !ENVELOPE.contains(&k.as_str()) && key_ok(k, v) {
+                root.insert(k.clone(), v.clone());
             }
         }
+        self.root = Value::Object(root);
     }
 
     fn set(&mut self, segs: &[String], value: Value) {
@@ -125,24 +132,16 @@ impl GsxState {
         set_path(&mut self.root, segs, value);
     }
 
+    /// `{path, value}`: a top-level path replaces that whole payload; a
+    /// deeper path is applied leniently and only below an existing key.
     fn patch(&mut self, msg: &Value) {
         let (Some(path), Some(value)) = (msg.get("path").and_then(Value::as_str), msg.get("value")) else {
             return;
         };
-        let mut segs: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(unescape).collect();
-        if segs.first().map(String::as_str) == Some("handlerData") {
-            segs.remove(0);
-            if segs.is_empty() {
-                if let Value::Object(h) = value {
-                    self.merge_object(h);
-                }
-                return;
-            }
-        }
+        let segs: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(unescape).collect();
         if segs.len() == 1 && !key_ok(&segs[0], value) {
             return;
         }
-        // A deep patch needs the top-level key to exist already.
         self.set(&segs, value.clone());
     }
 
@@ -154,16 +153,24 @@ impl GsxState {
         n.as_str().filter(|s| !s.is_empty())
     }
 
+    /// Display name of a gate or parking object: `uiName`, else `uiGateName`.
+    fn name_of(p: &Value) -> Option<&str> {
+        let s = |k: &str| p.get(k).and_then(Value::as_str).filter(|s| !s.is_empty());
+        s("uiName").or_else(|| s("uiGateName"))
+    }
+
     pub fn airport(&self) -> Option<&str> {
-        self.text(&["airport", "icao"])
+        self.text(&["handlerData", "airport", "icao"])
     }
 
     pub fn gate(&self) -> Option<&str> {
-        self.text(&["parking", "uiGateName"])
+        Self::name_of(self.root.pointer("/handlerData/gate")?)
     }
 
     pub fn gate_type(&self) -> Option<&str> {
-        self.text(&["parking", "uiType"])
+        let g = self.root.pointer("/handlerData/gate")?;
+        let s = |k: &str| g.get(k).and_then(Value::as_str).filter(|s| !s.is_empty());
+        s("uiType").or_else(|| s("type"))
     }
 
     pub fn services(&self) -> Vec<ServiceView> {
@@ -186,10 +193,11 @@ impl GsxState {
     }
 
     pub fn parkings(&self) -> Vec<String> {
-        let list = self.root.pointer("/airport/parkings").and_then(Value::as_array);
-        list.into_iter()
+        let list = self.root.pointer("/handlerData/airport/parkings");
+        list.and_then(Value::as_array)
+            .into_iter()
             .flatten()
-            .filter_map(|p| p.get("uiGateName").or_else(|| p.get("index"))?.as_str())
+            .filter_map(Self::name_of)
             .map(str::to_string)
             .collect()
     }
@@ -294,10 +302,13 @@ mod tests {
             json!({"type":"patch"}),
             json!({"type":"patch","path":5,"value":1}),
             json!({"type":"patch","path":"/services","value":"nope"}),
-            json!({"type":"patch","path":"/airport","value":[1]}),
+            json!({"type":"patch","path":"/handlerData","value":[1]}),
+            json!({"type":"patch","path":"/handlerData/airport/icao/x","value":1}),
             json!({"type":"patch","path":"/services/99/x","value":1}),
             json!({"type":"patch","path":"/airport/icao/x/y","value":1}),
             json!({"type":"snapshot","state":"nope"}),
+            json!({"type":"snapshot","state":{"handlerData":{}}}),
+            json!({"type":"snapshot","handlerData":{}}),
             json!({"type":"snapshot"}),
             json!({"type":"mystery","x":1}),
             json!({"type":"result","id":"a"}),
@@ -314,14 +325,51 @@ mod tests {
     }
 
     #[test]
-    fn handler_data_patch_merges_airport() {
+    fn handler_data_patch_replaces_the_whole_payload() {
         let mut s = GsxState::default();
-        let p = json!({"type":"patch","path":"/handlerData","value":{"airport":{"icao":"LFPG","parkings":[]}}});
-        s.apply(&p);
+        s.apply(&json!({"type":"snapshot","state":3,"handlerData":{
+            "airport":{"icao":"EHAM"},"gate":{"uiGateName":"D 7"}}}));
+        let hd = json!({"airport":{"icao":"LFPG","parkings":[]}});
+        s.apply(&json!({"type":"patch","path":"/handlerData","value":hd}));
         assert_eq!(s.airport(), Some("LFPG"));
+        assert_eq!(s.gate(), None, "the old gate went with the old payload");
         let q = json!({"type":"patch","path":"/handlerData/airport/icao","value":"LFPO"});
         s.apply(&q);
         assert_eq!(s.airport(), Some("LFPO"));
+    }
+
+    #[test]
+    fn gate_prefers_ui_name_and_falls_back() {
+        let mut s = GsxState::default();
+        let g = json!({"uiName":"Stand 5","uiGateName":"Gate 5","uiType":"","type":"RAMP"});
+        s.apply(&json!({"type":"snapshot","state":3,"handlerData":{"gate":g}}));
+        assert_eq!(s.gate(), Some("Stand 5"));
+        assert_eq!(s.gate_type(), Some("RAMP"));
+        let g = json!({"uiName":"","uiGateName":"Gate 5","uiType":"GATE_SMALL"});
+        s.apply(&json!({"type":"patch","path":"/handlerData","value":{"gate":g}}));
+        assert_eq!(s.gate(), Some("Gate 5"));
+        assert_eq!(s.gate_type(), Some("GATE_SMALL"));
+    }
+
+    #[test]
+    fn snapshot_shape_is_top_level_with_numeric_state() {
+        let mut s = GsxState::default();
+        let hd = json!({"airport":{"icao":"EHAM"},"gate":{"uiGateName":"D 7"}});
+        let svc = json!([{"id":"Boarding","stateRaw":1}]);
+        // The old guessed shape: payloads wrapped in a `state` object.
+        let wrapped = json!({"type":"snapshot","state":{"handlerData":hd,"services":svc}});
+        s.apply(&wrapped);
+        assert_eq!(s.airport(), None);
+        assert!(s.services().is_empty());
+        // The real shape: numeric state, payloads at the top level.
+        let real = json!({"v":2,"type":"snapshot","state":3,"handlerData":hd,"services":svc});
+        s.apply(&real);
+        assert_eq!(s.airport(), Some("EHAM"));
+        assert_eq!(s.gate(), Some("D 7"));
+        assert_eq!(s.services().len(), 1);
+        // A later non-numeric snapshot keeps the good state.
+        s.apply(&wrapped);
+        assert_eq!(s.airport(), Some("EHAM"));
     }
 
     #[test]

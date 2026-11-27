@@ -848,7 +848,7 @@ mod tests {
                 let (s, _) = l.accept().await.unwrap();
                 let mut ws = tokio_tungstenite::accept_async(s).await.unwrap();
                 let hello = r#"{"type":"hello","protocol":2,"engine":"4.0.8"}"#;
-                let snap = r#"{"type":"snapshot","state":{"airport":{"icao":"EHAM"}}}"#;
+                let snap = r#"{"type":"snapshot","state":3,"handlerData":{"airport":{"icao":"EHAM"}}}"#;
                 ws.send(Message::text(hello)).await.unwrap();
                 ws.send(Message::text(snap)).await.unwrap();
                 while let Some(Ok(_)) = ws.next().await {}

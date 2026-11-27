@@ -402,11 +402,13 @@ mod tests {
     const HELLO: &str = r#"{"type":"hello","protocol":2,"engine":"4.0.8","authRequired":false}"#;
 
     fn snapshot(gate: &str) -> String {
-        json!({"type":"snapshot","state":{
-            "airport":{"icao":"EHAM","parkings":[{"uiGateName":"D 7"},{"uiGateName":"D 8"}]},
-            "parking":{"uiGateName":gate,"uiType":"GATE_MEDIUM"},
+        json!({"type":"snapshot","state":3,
+            "handlerData":{
+                "airport":{"icao":"EHAM",
+                    "parkings":[{"uiGateName":"D 7"},{"uiGateName":"D 8"}]},
+                "gate":{"uiName":"","uiGateName":gate,"uiType":"GATE_MEDIUM"}},
             "services":[{"id":"Boarding","stateRaw":5,"canTrigger":false,
-                "progressText":"31/174 passengers"}]}})
+                "progressText":"31/174 passengers"}]})
         .to_string()
     }
 
@@ -721,7 +723,7 @@ mod tests {
     async fn a_dropped_socket_clears_the_block_and_reconnects_fresh() {
         let first = (vec![HELLO.into(), snapshot("D 7")], true);
         // The second session sends only a patch: no snapshot yet.
-        let patch = json!({"type":"patch","path":"/parking/uiGateName","value":"D 8"});
+        let patch = json!({"type":"patch","path":"/handlerData/gate/uiGateName","value":"D 8"});
         let second = (vec![HELLO.into(), patch.to_string()], false);
         let g = fake_gsx(vec![first, second]).await;
         let a = app(ResponseTemplate::new(204)).await;

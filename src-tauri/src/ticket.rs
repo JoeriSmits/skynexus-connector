@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
-use crate::api::{ApiClient, ApiError, Ticket, SKEW_WARN_S};
+use crate::api::{ApiClient, ApiError, Features, Ticket, SKEW_WARN_S};
 
 /// Refresh this long before the ticket expires (at most half its lifetime).
 pub const REFRESH_MARGIN: Duration = Duration::from_secs(90);
@@ -17,9 +17,9 @@ pub struct TicketManager {
     api: ApiClient,
     credential: String,
     current: Option<Ticket>,
-    /// Gets `features.techlog` of every ticket fetched, so the TechLog
-    /// runner can pick up the server switch on each renewal.
-    features: Option<watch::Sender<bool>>,
+    /// Gets `features` of every ticket fetched, so the TechLog tasks pick
+    /// up the server switches on each renewal.
+    features: Option<watch::Sender<Features>>,
 }
 
 fn refresh_at(t: &Ticket) -> Instant {
@@ -36,9 +36,9 @@ impl TicketManager {
         }
     }
 
-    /// Publishes `features.techlog` of every fetched ticket on `tx`, even
-    /// when it did not change (the runner waits for the next ticket).
-    pub fn with_features(mut self, tx: watch::Sender<bool>) -> Self {
+    /// Publishes `features` of every fetched ticket on `tx`, even when they
+    /// did not change (the TechLog tasks wait for the next ticket).
+    pub fn with_features(mut self, tx: watch::Sender<Features>) -> Self {
         self.features = Some(tx);
         self
     }
@@ -59,7 +59,7 @@ impl TicketManager {
             );
         }
         if let Some(f) = &self.features {
-            f.send_replace(t.techlog);
+            f.send_replace(t.features);
         }
         self.current = Some(t.clone());
         Ok(t)
@@ -183,11 +183,11 @@ mod tests {
     async fn every_fetched_ticket_publishes_its_techlog_feature() {
         let features = serde_json::json!({ "techlog": true });
         let s = server(serde_json::json!({ "ticket": "opaque", "expires_in": 900, "features": features })).await;
-        let (tx, mut rx) = watch::channel(false);
+        let (tx, mut rx) = watch::channel(Features::default());
         let mut m = TicketManager::new(ApiClient::new(&s.uri()), "cred-1".into()).with_features(tx);
         let t0 = Instant::now();
         m.valid(t0).await.unwrap();
-        assert!(rx.has_changed().unwrap() && *rx.borrow_and_update());
+        assert!(rx.has_changed().unwrap() && rx.borrow_and_update().techlog);
         m.valid(t0).await.unwrap();
         assert!(!rx.has_changed().unwrap(), "a cached ticket is not a renewal");
         m.invalidate();

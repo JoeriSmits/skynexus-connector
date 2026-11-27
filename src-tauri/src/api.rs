@@ -256,9 +256,29 @@ pub struct Ticket {
     /// Local clock minus server clock, in seconds, from the JWT `iat`.
     pub clock_skew_s: Option<i64>,
     pub relay_url: Option<String>,
-    /// `features.techlog`: the server allows the TechLog link. A missing
-    /// `features` means false.
+    pub features: Features,
+}
+
+/// The ticket's `features`. Lenient: a missing or odd value is false, so it
+/// never costs the ticket.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Features {
+    /// `features.techlog`: the server allows the TechLog link (the kill
+    /// switch). Nothing TechLog runs without it.
     pub techlog: bool,
+}
+
+impl Features {
+    fn parse(v: Option<&serde_json::Value>) -> Self {
+        let flag = |k: &str| {
+            v.and_then(|f| f.get(k))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        };
+        Features {
+            techlog: flag("techlog"),
+        }
+    }
 }
 
 impl Ticket {
@@ -274,7 +294,7 @@ impl std::fmt::Debug for Ticket {
             .field("lifetime", &self.lifetime)
             .field("clock_skew_s", &self.clock_skew_s)
             .field("relay_url", &self.relay_url)
-            .field("techlog", &self.techlog)
+            .field("features", &self.features)
             .finish()
     }
 }
@@ -314,12 +334,7 @@ pub fn parse_ticket(body: &str, now_ms: u64, received: Instant) -> Result<Ticket
         received,
         clock_skew_s,
         relay_url: b.relay_url.filter(|u| !u.is_empty()),
-        techlog: b
-            .features
-            .as_ref()
-            .and_then(|f| f.get("techlog"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
+        features: Features::parse(b.features.as_ref()),
     })
 }
 
@@ -705,7 +720,7 @@ mod tests {
     #[test]
     fn ticket_features_techlog_defaults_to_false() {
         let r = Instant::now();
-        let t = |body: &str| parse_ticket(body, 0, r).unwrap().techlog;
+        let t = |body: &str| parse_ticket(body, 0, r).unwrap().features.techlog;
         assert!(!t(r#"{"ticket":"opaque"}"#), "missing features");
         assert!(!t(r#"{"ticket":"opaque","features":{}}"#));
         assert!(!t(r#"{"ticket":"opaque","features":{"techlog":"yes"}}"#));

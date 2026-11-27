@@ -22,14 +22,14 @@ use tokio::time::{sleep, Instant};
 
 use super::client::{Code, TechlogClient};
 use super::snapshot::{self, Snapshot};
-use crate::api::{ApiClient, ApiError};
+use crate::api::{ApiClient, ApiError, Features};
 
 /// The server refuses bodies above this many bytes.
 pub const MAX_BODY_BYTES: usize = 32_768;
 /// The health object's schema version.
 pub const HEALTH_SCHEMA: u8 = 1;
 /// The longest `Retry-After` honoured from the TechLog route.
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
+pub(super) const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
 
 /// Resend an unchanged `OK` snapshot this often: well inside the EFB's 30 min freshness window,
 /// so data the pilot is looking at never ages to stale while TechLog is up.
@@ -58,8 +58,8 @@ impl Default for RunnerTiming {
 pub struct RunnerCfg {
     /// The connector credential; None while signed out.
     pub credential: watch::Receiver<Option<String>>,
-    /// `features.techlog` of every ticket, published on each renewal.
-    pub features: watch::Receiver<bool>,
+    /// `features` of every ticket, published on each renewal.
+    pub features: watch::Receiver<Features>,
     pub timing: RunnerTiming,
 }
 
@@ -100,7 +100,7 @@ impl Tracker {
 }
 
 /// The server's pattern for `techlogVersion`: `^\d{1,4}(\.\d{1,4}){1,3}$`.
-fn valid_version(v: &str) -> bool {
+pub(super) fn valid_version(v: &str) -> bool {
     let parts: Vec<&str> = v.split('.').collect();
     (2..=4).contains(&parts.len())
         && parts
@@ -120,7 +120,7 @@ fn checked_version(code: Code, version: Option<String>) -> (Code, Option<String>
 }
 
 /// The `health` object. Optional keys are left out, never sent as null.
-fn health(code: &Code, techlog_version: Option<&str>) -> Value {
+pub(super) fn health(code: &Code, techlog_version: Option<&str>) -> Value {
     let mut h = Map::new();
     h.insert("code".into(), json!(code.as_str()));
     if let Some(p) = code.path() {
@@ -167,7 +167,7 @@ fn publish(tl_out: &watch::Sender<Option<String>>, v: Option<String>) {
     });
 }
 
-fn describe(code: &Code) -> String {
+pub(super) fn describe(code: &Code) -> String {
     match (code.path(), code.http_status()) {
         (Some(p), _) => format!("{} at {p}", code.as_str()),
         (_, Some(s)) => format!("{} {s}", code.as_str()),
@@ -200,7 +200,7 @@ pub async fn run(
     let mut post_failing: Option<std::mem::Discriminant<ApiError>> = None;
     loop {
         let credential = cfg.credential.borrow_and_update().clone();
-        let feature = *cfg.features.borrow_and_update();
+        let feature = cfg.features.borrow_and_update().techlog;
         let on = *enabled.borrow_and_update();
         if blocked(on, credential.as_ref(), refused.as_ref(), feature, server_off) {
             publish(&tl_out, None);
@@ -369,7 +369,7 @@ mod tests {
         tl: watch::Receiver<Option<String>>,
         enabled: watch::Sender<bool>,
         credential: watch::Sender<Option<String>>,
-        features: watch::Sender<bool>,
+        features: watch::Sender<Features>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -383,7 +383,7 @@ mod tests {
         let (tl_tx, tl) = watch::channel(None);
         let (enabled, enabled_rx) = watch::channel(true);
         let (credential, credential_rx) = watch::channel(Some("snc_1".to_string()));
-        let (features, features_rx) = watch::channel(feature);
+        let (features, features_rx) = watch::channel(Features { techlog: feature });
         let cfg = RunnerCfg {
             credential: credential_rx,
             features: features_rx,
@@ -542,7 +542,7 @@ mod tests {
         assert_eq!(hits(&tl, "/api/ping").await, 0);
         assert!(posts(&a).await.is_empty());
         // the next ticket allows it
-        h.features.send_replace(true);
+        h.features.send_replace(Features { techlog: true });
         until("a post", async || posts(&a).await.len() == 1).await;
     }
 
@@ -568,7 +568,7 @@ mod tests {
         assert_eq!(hits(&tl, "/api/ping").await, reads, "stopped reading");
         assert_eq!(*h.tl.borrow(), None);
         // a renewed ticket, still allowed
-        h.features.send_replace(true);
+        h.features.send_replace(Features { techlog: true });
         until("the post after renewal", async || posts(&a).await.len() == 2).await;
         until("tl", async || h.tl.borrow().is_some()).await;
     }

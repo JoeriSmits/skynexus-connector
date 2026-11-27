@@ -67,6 +67,9 @@ fn set_path(root: &mut Value, segs: &[String], value: Value) {
     }
 }
 
+/// Merged state of one GSX session. A `hello` starts a new session and
+/// calls `reset`, so a reconnect never keeps the old services as live.
+/// The supervisor should also call `reset` when the socket drops.
 #[derive(Debug, Default)]
 pub struct GsxState {
     version: Option<String>,
@@ -78,7 +81,9 @@ pub struct GsxState {
 impl GsxState {
     pub fn apply(&mut self, msg: &Value) {
         match msg.get("type").and_then(Value::as_str) {
-            Some("hello") => {
+            // A hello without a numeric protocol is malformed: ignore it.
+            Some("hello") if msg.get("protocol").is_some_and(Value::is_u64) => {
+                self.reset();
                 if let Some(e) = msg.get("engine").and_then(Value::as_str) {
                     self.version = Some(e.to_string());
                 }
@@ -93,6 +98,12 @@ impl GsxState {
             // Results are the client's business; events carry nothing we show.
             _ => {}
         }
+    }
+
+    /// Forgets everything: snapshot data and the engine version.
+    pub fn reset(&mut self) {
+        self.root = Value::Null;
+        self.version = None;
     }
 
     fn merge_object(&mut self, obj: &serde_json::Map<String, Value>) {
@@ -311,5 +322,29 @@ mod tests {
         let q = json!({"type":"patch","path":"/handlerData/airport/icao","value":"LFPO"});
         s.apply(&q);
         assert_eq!(s.airport(), Some("LFPO"));
+    }
+
+    #[test]
+    fn hello_after_reconnect_drops_stale_state() {
+        let msgs = fixture();
+        let mut s = GsxState::default();
+        msgs[..2].iter().for_each(|m| s.apply(m));
+        assert_eq!(s.services().len(), 12);
+        s.apply(&json!({"type":"hello","protocol":2,"engine":"4.0.9"}));
+        assert!(s.services().is_empty());
+        assert_eq!(s.airport(), None);
+        assert_eq!(s.gate(), None);
+        assert_eq!(s.version(), Some("4.0.9"));
+    }
+
+    #[test]
+    fn reset_clears_everything() {
+        let msgs = fixture();
+        let mut s = GsxState::default();
+        msgs[..2].iter().for_each(|m| s.apply(m));
+        s.reset();
+        assert!(s.services().is_empty());
+        assert_eq!(s.version(), None);
+        assert_eq!(s.airport(), None);
     }
 }

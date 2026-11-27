@@ -13,6 +13,9 @@ use super::detect::Hello;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// GSX says hello right after connecting; no hello in this time is Invalid.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(3);
+/// Messages kept for `next` while a command waits; the oldest are dropped.
+const BACKLOG_MAX: usize = 256;
+const SEND_TIMEOUT: Duration = Duration::from_secs(3);
 const RESULT_TIMEOUT: Duration = Duration::from_secs(3);
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -88,8 +91,12 @@ impl GsxClient {
         Ok((c, hello))
     }
 
-    async fn send(&mut self, v: &Value) -> Result<(), tokio_tungstenite::tungstenite::Error> {
-        self.ws.send(Message::text(v.to_string())).await
+    async fn send(&mut self, v: &Value) -> anyhow::Result<()> {
+        let sent = self.ws.send(Message::text(v.to_string()));
+        tokio::time::timeout(SEND_TIMEOUT, sent)
+            .await
+            .map_err(|_| anyhow::anyhow!("send timeout"))??;
+        Ok(())
     }
 
     /// Next JSON text message; skips pings, binary and non-JSON text.
@@ -134,6 +141,9 @@ impl GsxClient {
                     && v.get("id").and_then(Value::as_str) == Some(id.as_str());
                 if is_ours {
                     return Some(v);
+                }
+                if self.backlog.len() >= BACKLOG_MAX {
+                    self.backlog.pop_front();
                 }
                 self.backlog.push_back(v);
             }
@@ -289,5 +299,29 @@ mod tests {
         c.result_timeout = Duration::from_millis(200);
         let e = c.command("menu.close", json!({})).await.unwrap_err();
         assert!(e.to_string().contains("timeout"));
+    }
+
+    #[tokio::test]
+    async fn backlog_is_capped_dropping_the_oldest() {
+        let port = server(|mut ws| async move {
+            ws.send(Message::text(HELLO)).await.unwrap();
+            text(&mut ws).await;
+            text(&mut ws).await;
+            text(&mut ws).await;
+            for n in 0..300 {
+                ws.send(Message::text(format!(r#"{{"type":"patch","n":{n}}}"#)))
+                    .await
+                    .unwrap();
+            }
+            ws.send(Message::text(r#"{"type":"result","id":"sn.1","ok":true}"#))
+                .await
+                .unwrap();
+            let _ = ws.next().await;
+        })
+        .await;
+        let (mut c, _) = GsxClient::connect(port).await.unwrap_or_else(|_| panic!("refused"));
+        c.command("menu.close", json!({})).await.unwrap();
+        assert_eq!(c.backlog.len(), BACKLOG_MAX);
+        assert_eq!(c.next().await.unwrap()["n"], 300 - BACKLOG_MAX);
     }
 }

@@ -3,7 +3,10 @@
 //!
 //! - Detects at once after MSFS connects (a flight loaded) and every 30 s
 //!   after that; X-Plane and replays never probe and never post. While the
-//!   socket is being read, detection does not open a second one.
+//!   socket is being read, detection does not open a second one. A probe
+//!   reads only the hello and sends nothing; a socket that is not read is
+//!   closed with a Close frame. An installed GSX is always dialled: a valid
+//!   hello wins over `L:FSDT_GSX_COUATL_STARTED`.
 //! - POSTs `{health: {code, connectorVersion, schema: 1, gsxVersion?, reading}}`
 //!   only when (code, gsxVersion, reading) changed, and once after sign-in.
 //!   The last accepted value is kept on disk with a fingerprint of the
@@ -16,10 +19,14 @@
 //!   in MSFS. The read loop runs in its own task with a fresh [`GsxState`]
 //!   per connection, stopped (and awaited) when any of that stops; the
 //!   current block and gate list go on `out` for the frame builder
-//!   ([`frame_json`]). A socket that drops is redialled after 2 s, doubling
+//!   ([`frame_json`]). Only the read loop subscribes (to `state`). A socket
+//!   that drops, the subscription included, is redialled after 2 s, doubling
 //!   to 30 s while sessions keep dropping, back to 2 s after one of 60 s.
 //! - A 503 `disabled` stops posting until the next ticket; a 401 until the
-//!   credential changes; a 400 is not resent for the same health.
+//!   credential changes; a 400 is not resent for the same health. Any other
+//!   failure (404, 5xx, network) holds that health for 30 s, doubling to
+//!   30 min, and `Retry-After` when longer; a success or a changed health
+//!   starts over.
 //! - The relay's `cmd` messages ([`super::commands`]): `gsx.read` sets the
 //!   read switch until the next ticket; `gsx.gate` and `gsx.simbrief` run
 //!   in the read loop, one at a time, and their result rides on the blocks
@@ -95,6 +102,10 @@ pub struct GsxTiming {
     pub reconnect_max: Duration,
     /// A session that lasted this long resets the reconnect wait.
     pub stable_after: Duration,
+    /// After a failed health post, before the same health is posted again;
+    /// doubles on every failure up to `post_backoff_max`.
+    pub post_backoff: Duration,
+    pub post_backoff_max: Duration,
 }
 
 impl Default for GsxTiming {
@@ -105,6 +116,8 @@ impl Default for GsxTiming {
             reconnect_after: Duration::from_secs(2),
             reconnect_max: Duration::from_secs(30),
             stable_after: Duration::from_secs(60),
+            post_backoff: Duration::from_secs(30),
+            post_backoff_max: Duration::from_secs(30 * 60),
         }
     }
 }
@@ -237,6 +250,13 @@ async fn read_loop(
     out: watch::Sender<Option<GsxFeed>>,
     mut cmds: mpsc::Receiver<ToReader>,
 ) {
+    // Only a session that is read subscribes. A GSX that drops here ends
+    // the loop like any dropped socket, so the runner redials it with backoff.
+    if let Err(e) = client.subscribe().await {
+        log::info!("gsx: the socket dropped before the subscription ({e})");
+        publish(&out, None);
+        return;
+    }
     // `connect` consumed the hello: seed the new session's state with it.
     let mut state = GsxState::default();
     state.apply(&hello);
@@ -339,28 +359,79 @@ fn on_cmd(
     false
 }
 
-/// One detection. With a readable GSX, also the open client and its hello,
-/// for the read loop.
+/// One detection: the hello only, nothing is sent. With a readable GSX,
+/// also the open client and its hello, for the read loop; any other socket
+/// is closed with a Close frame. An installed GSX is always dialled: a
+/// valid hello wins over `L:FSDT_GSX_COUATL_STARTED`.
 async fn probe(p: &GsxProbe, couatl: Option<bool>) -> (GsxCode, Option<String>, Option<(GsxClient, Value)>) {
     if !(p.installed)() {
         return (GsxCode::NotInstalled, None, None);
-    }
-    if couatl == Some(false) {
-        return (GsxCode::NotRunning, None, None);
     }
     let (hello, client) = match GsxClient::connect((p.port)()).await {
         Ok((c, h)) => (h, Some(c)),
         Err(h) => (h, None),
     };
     let code = classify(true, couatl, hello.clone());
-    match hello {
+    let (version, seed) = match hello {
         Hello::Valid { protocol, engine, .. } => {
-            let version = version_of(&engine);
             let seed = json!({"type": "hello", "protocol": protocol, "engine": engine});
-            let client = client.filter(|_| code == GsxCode::Ok).map(|c| (c, seed));
-            (code, version, client)
+            (version_of(&engine), Some(seed))
         }
-        _ => (code, None, None),
+        _ => (None, None),
+    };
+    match (client, seed) {
+        (Some(c), Some(seed)) if code == GsxCode::Ok => (code, version, Some((c, seed))),
+        (Some(c), _) => {
+            c.close().await;
+            (code, version, None)
+        }
+        (None, _) => (code, version, None),
+    }
+}
+
+/// Holds the health post after failures (404, 5xx, network): `base`, then
+/// doubling up to `max`. A success, or a health that differs from the one
+/// that failed, starts over.
+struct PostBackoff {
+    base: Duration,
+    max: Duration,
+    step: Option<Duration>,
+    until: Option<Instant>,
+    failed: Option<GsxPosted>,
+}
+
+impl PostBackoff {
+    fn new(base: Duration, max: Duration) -> Self {
+        PostBackoff {
+            base,
+            max,
+            step: None,
+            until: None,
+            failed: None,
+        }
+    }
+
+    /// True while `current` is the health that failed and its wait runs.
+    fn holds(&mut self, now: Instant, current: &GsxPosted) -> bool {
+        if self.failed.as_ref().is_some_and(|f| f != current) {
+            self.reset();
+        }
+        self.until.is_some_and(|u| now < u)
+    }
+
+    /// `current` failed at `now`; returns the wait before it is sent again.
+    fn fail(&mut self, now: Instant, current: &GsxPosted) -> Duration {
+        let step = self.step.map_or(self.base, |s| s.saturating_mul(2)).min(self.max);
+        self.step = Some(step);
+        self.until = Some(now + step);
+        self.failed = Some(current.clone());
+        step
+    }
+
+    fn reset(&mut self) {
+        self.step = None;
+        self.until = None;
+        self.failed = None;
     }
 }
 
@@ -406,8 +477,9 @@ pub async fn run(mut cfg: GsxRunnerCfg, api: ApiClient, out: watch::Sender<Optio
     let mut server_off = false;
     // A health the server refused with 400; not sent again.
     let mut invalid: Option<GsxPosted> = None;
-    // `Retry-After` of the last failed post.
+    // `Retry-After` of the last failed post, whatever the health.
     let mut hold_until: Option<Instant> = None;
+    let mut backoff = PostBackoff::new(t.post_backoff, t.post_backoff_max);
     let mut post_failing = false;
     let mut msfs_since: Option<Instant> = None;
     let mut last_logged: Option<GsxPosted> = None;
@@ -448,16 +520,21 @@ pub async fn run(mut cfg: GsxRunnerCfg, api: ApiClient, out: watch::Sender<Optio
                     None => {
                         let couatl = cfg.extras.borrow().couatl_started;
                         let (code, version, client) = probe(&cfg.probe, couatl).await;
-                        if let Some((client, hello)) = client.filter(|_| gsx && gsx_read && tray) {
-                            let (tx, rx) = mpsc::channel(READER_QUEUE);
-                            let extras = cfg.extras.clone();
-                            let task = tokio::spawn(read_loop(client, hello, extras, out.clone(), rx));
-                            reader = Some(Reader {
-                                task,
-                                version: version.clone(),
-                                started: Instant::now(),
-                                cmds: tx,
-                            });
+                        match client {
+                            Some((client, hello)) if gsx && gsx_read && tray => {
+                                let (tx, rx) = mpsc::channel(READER_QUEUE);
+                                let extras = cfg.extras.clone();
+                                let task = tokio::spawn(read_loop(client, hello, extras, out.clone(), rx));
+                                reader = Some(Reader {
+                                    task,
+                                    version: version.clone(),
+                                    started: Instant::now(),
+                                    cmds: tx,
+                                });
+                            }
+                            // Not read: detection was all this socket was for.
+                            Some((client, _)) => client.close().await,
+                            None => {}
                         }
                         (code, version)
                     }
@@ -476,19 +553,24 @@ pub async fn run(mut cfg: GsxRunnerCfg, api: ApiClient, out: watch::Sender<Optio
                 let now = Instant::now();
                 let settling =
                     matches!(code, GsxCode::NotRunning | GsxCode::NoApi) && now.duration_since(since) < t.settle;
+                let backing_off = backoff.holds(now, &current);
                 let held = refused.as_ref() == Some(credential)
                     || server_off
                     || settling
                     || invalid.as_ref() == Some(&current)
+                    || backing_off
                     || hold_until.is_some_and(|h| now < h);
                 if !held && posted.as_ref() != Some(&current) {
                     let result = api.post_gsx(credential, &body(&current)).await;
-                    if !matches!(
-                        result,
-                        Err(ApiError::Network(_) | ApiError::RateLimited { .. } | ApiError::Unavailable { .. })
-                    ) {
+                    if result.is_ok()
+                        || matches!(
+                            result,
+                            Err(ApiError::Unauthorized | ApiError::InvalidBody { .. } | ApiError::Disabled)
+                        )
+                    {
                         post_failing = false;
                         hold_until = None;
+                        backoff.reset();
                     }
                     match result {
                         Ok(()) => {
@@ -514,8 +596,10 @@ pub async fn run(mut cfg: GsxRunnerCfg, api: ApiClient, out: watch::Sender<Optio
                             cfg.features.borrow_and_update();
                         }
                         Err(e) => {
+                            let wait = backoff.fail(now, &current);
                             if !post_failing {
-                                log::info!("gsx: cannot post the health ({e}); retrying");
+                                let secs = wait.as_secs();
+                                log::info!("gsx: cannot post the health ({e}); retrying in {secs} s");
                                 post_failing = true;
                             }
                             hold_until = e.retry_after().map(|d| now + d.min(MAX_RETRY_AFTER));
@@ -615,13 +699,19 @@ mod tests {
     }
 
     /// A local GSX: each connection gets the next script (the last one
-    /// repeats), then stays open (or closes when `close` is set).
+    /// repeats), then stays open, or with `close` sends a Close frame and
+    /// reads until the client is gone, so the close is clean on every OS
+    /// (unread data would make it a reset on Windows).
     struct FakeGsx {
         port: u16,
         accepts: Arc<AtomicUsize>,
         closed: Arc<AtomicUsize>,
         /// Commands it got, other than `state.get`.
         got: Arc<Mutex<Vec<Value>>>,
+        /// Every text message it got.
+        all: Arc<Mutex<Vec<Value>>>,
+        /// Close frames it got from the client.
+        close_frames: Arc<AtomicUsize>,
         task: JoinHandle<()>,
     }
 
@@ -643,28 +733,36 @@ mod tests {
         let port = l.local_addr().unwrap().port();
         let (accepts, closed) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let got = Arc::new(Mutex::new(Vec::new()));
+        let all = Arc::new(Mutex::new(Vec::new()));
+        let close_frames = Arc::new(AtomicUsize::new(0));
         let (a, c, g) = (accepts.clone(), closed.clone(), got.clone());
+        let (al, cf) = (all.clone(), close_frames.clone());
         let task = tokio::spawn(async move {
             loop {
                 let (s, _) = l.accept().await.unwrap();
                 let n = a.fetch_add(1, Ordering::SeqCst);
                 let (msgs, close) = scripts[n.min(scripts.len() - 1)].clone();
-                let (c, g) = (c.clone(), g.clone());
+                let (c, g, al, cf) = (c.clone(), g.clone(), al.clone(), cf.clone());
                 tokio::spawn(async move {
-                    let mut ws = tokio_tungstenite::accept_async(s).await.unwrap();
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(s).await else {
+                        return;
+                    };
                     for m in msgs {
                         if ws.send(Message::text(m)).await.is_err() {
                             break;
                         }
                     }
                     if close {
-                        c.fetch_add(1, Ordering::SeqCst);
-                        return;
+                        let _ = ws.close(None).await;
                     }
                     while let Some(Ok(m)) = ws.next().await {
+                        if matches!(m, Message::Close(_)) {
+                            cf.fetch_add(1, Ordering::SeqCst);
+                        }
                         let Message::Text(t) = m else { continue };
                         let v: Value = serde_json::from_str(&t).unwrap();
-                        if v["type"] != "command" || v["verb"] == "state.get" {
+                        al.lock().unwrap().push(v.clone());
+                        if close || v["type"] != "command" || v["verb"] == "state.get" {
                             continue;
                         }
                         g.lock().unwrap().push(v.clone());
@@ -683,6 +781,8 @@ mod tests {
             accepts,
             closed,
             got,
+            all,
+            close_frames,
             task,
         }
     }
@@ -713,6 +813,8 @@ mod tests {
             reconnect_after: Duration::from_millis(10),
             reconnect_max: Duration::from_millis(40),
             stable_after: Duration::from_secs(60),
+            post_backoff: Duration::from_millis(10),
+            post_backoff_max: Duration::from_millis(40),
         }
     }
 
@@ -723,6 +825,7 @@ mod tests {
         features: Option<(bool, bool)>,
         file: Option<PathBuf>,
         timing: GsxTiming,
+        couatl: Option<bool>,
     }
 
     fn opts(port: u16) -> Opts {
@@ -733,6 +836,7 @@ mod tests {
             features: Some((true, true)),
             file: None,
             timing: fast(),
+            couatl: None,
         }
     }
 
@@ -783,7 +887,11 @@ mod tests {
         let (features, features_rx) = watch::channel(o.features);
         let (tray, tray_rx) = watch::channel(true);
         let (sim, sim_rx) = watch::channel(Some(o.sim));
-        let (extras, extras_rx) = watch::channel(SimExtras::default());
+        let ex = SimExtras {
+            couatl_started: o.couatl,
+            ..SimExtras::default()
+        };
+        let (extras, extras_rx) = watch::channel(ex);
         let (cmds, cmds_rx) = mpsc::channel(16);
         let installed = o.installed;
         let port = o.port;
@@ -1105,6 +1213,140 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(600)).await;
         let n = g.accepts.load(Ordering::SeqCst);
         assert!((3..=6).contains(&n), "{n} dials");
+    }
+
+    #[tokio::test]
+    async fn a_gsx_that_drops_right_after_its_hello_is_redialled_ever_slower() {
+        // Hello, then a Close before the subscription: the read loop ends at
+        // once and the runner backs off, on every OS.
+        let g = fake_gsx(vec![(vec![HELLO.into()], true)]).await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let timing = GsxTiming {
+            reconnect_after: Duration::from_millis(40),
+            reconnect_max: Duration::from_millis(320),
+            ..fast()
+        };
+        let _h = start(&a, Opts { timing, ..opts(g.port) });
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let n = g.accepts.load(Ordering::SeqCst);
+        assert!((3..=6).contains(&n), "{n} dials");
+    }
+
+    #[tokio::test]
+    async fn with_reading_off_detection_only_reads_the_hello() {
+        for features in [(true, false), (false, true)] {
+            let g = gsx_up().await;
+            let a = app(ResponseTemplate::new(204)).await;
+            let o = Opts {
+                features: Some(features),
+                ..opts(g.port)
+            };
+            let _h = start(&a, o);
+            n_posts(&a, 1).await;
+            until("three probes", async || g.accepts.load(Ordering::SeqCst) >= 3).await;
+            until("closed probes", async || g.close_frames.load(Ordering::SeqCst) >= 2).await;
+            let all = g.all.lock().unwrap().clone();
+            assert!(all.is_empty(), "{features:?}: no subscribe or state.get: {all:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn couatl_reading_zero_does_not_stop_a_gsx_that_says_hello() {
+        let g = gsx_up().await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let o = Opts {
+            couatl: Some(false),
+            ..opts(g.port)
+        };
+        let mut h = start(&a, o);
+        let up = tokio::time::timeout(Duration::from_secs(5), h.out.wait_for(Option::is_some));
+        up.await.expect("GSX was not read").unwrap();
+        n_posts(&a, 1).await;
+        assert_eq!(health(&posts(&a).await[0])["code"], "GSX_OK");
+    }
+
+    #[tokio::test]
+    async fn failed_posts_back_off_and_success_resets() {
+        let a = MockServer::start().await;
+        let down = ResponseTemplate::new(503).set_body_json(json!({ "error": "unavailable" }));
+        Mock::given(method("POST"))
+            .respond_with(down)
+            .up_to_n_times(5)
+            .with_priority(1)
+            .mount(&a)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204))
+            .with_priority(5)
+            .mount(&a)
+            .await;
+        let timing = GsxTiming {
+            detect_every: Duration::from_millis(5),
+            post_backoff: Duration::from_millis(20),
+            post_backoff_max: Duration::from_millis(160),
+            ..fast()
+        };
+        let o = Opts {
+            installed: false,
+            timing,
+            ..opts(refused_port())
+        };
+        let t0 = std::time::Instant::now();
+        let h = start(&a, o);
+        // Waits 20, 40, 80, 160, 160 ms: about 460 ms for five failures.
+        n_posts(&a, 6).await;
+        let took = t0.elapsed();
+        assert!(took >= Duration::from_millis(400), "{took:?}");
+        quiet().await;
+        assert_eq!(posts(&a).await.len(), 6, "accepted, then quiet");
+        // A new sign-in after the success posts at once.
+        h.credential.send_replace(Some("snc_2".into()));
+        n_posts(&a, 7).await;
+    }
+
+    #[tokio::test]
+    async fn a_changed_health_posts_at_once_during_the_backoff() {
+        let g = gsx_up().await;
+        let a = app(ResponseTemplate::new(404)).await;
+        let timing = GsxTiming {
+            post_backoff: Duration::from_secs(10),
+            post_backoff_max: Duration::from_secs(60),
+            ..fast()
+        };
+        let mut h = start(&a, Opts { timing, ..opts(g.port) });
+        h.out.wait_for(Option::is_some).await.unwrap();
+        n_posts(&a, 1).await;
+        quiet().await;
+        assert_eq!(posts(&a).await.len(), 1, "404: held for the backoff");
+        h.tray.send_replace(false);
+        n_posts(&a, 2).await;
+        assert_eq!(health(&posts(&a).await[1])["reading"], false);
+        quiet().await;
+        assert_eq!(posts(&a).await.len(), 2);
+    }
+
+    #[test]
+    fn post_backoff_doubles_to_its_cap_and_starts_over() {
+        let ms = Duration::from_millis;
+        let mut b = PostBackoff::new(ms(30), ms(200));
+        let t0 = Instant::now();
+        let p = |code| GsxPosted {
+            credential: "f".into(),
+            code,
+            gsx_version: None,
+            reading: false,
+        };
+        let (down, up) = (p(GsxCode::NotRunning), p(GsxCode::Ok));
+        let steps: Vec<_> = (0..5).map(|_| b.fail(t0, &down)).collect();
+        assert_eq!(steps, [ms(30), ms(60), ms(120), ms(200), ms(200)]);
+        assert!(b.holds(t0 + ms(199), &down));
+        assert!(!b.holds(t0 + ms(200), &down));
+        assert!(b.holds(t0 + ms(10), &down));
+        assert!(!b.holds(t0 + ms(10), &up), "another health is not held");
+        assert_eq!(b.fail(t0, &up), ms(30), "and starts over");
+        b.reset();
+        assert!(!b.holds(t0, &up));
+        assert_eq!(b.fail(t0, &up), ms(30), "a success starts over");
     }
 
     #[test]

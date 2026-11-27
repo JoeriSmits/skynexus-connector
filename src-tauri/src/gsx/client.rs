@@ -1,5 +1,6 @@
-//! Client for GSX's local Remote API (WebSocket, protocol 2). Connects,
-//! reads the hello, subscribes, and sends commands with ids `sn.<n>`.
+//! Client for GSX's local Remote API (WebSocket, protocol 2). Connects and
+//! reads the hello (all detection needs), subscribes to `state` only when
+//! GSX is read, and sends commands with ids `sn.<n>`.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -55,7 +56,12 @@ fn parse_hello(v: &Value) -> Option<Hello> {
     if v.get("type")?.as_str()? != "hello" {
         return None;
     }
-    let protocol = u32::try_from(v.get("protocol")?.as_u64()?).ok()?;
+    // A number, or the same number as a digit string.
+    let protocol = match v.get("protocol")? {
+        Value::Number(n) => u32::try_from(n.as_u64()?).ok()?,
+        Value::String(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => s.parse().ok()?,
+        _ => return None,
+    };
     let engine = v.get("engine").and_then(Value::as_str).unwrap_or("").to_string();
     let auth_required = v.get("authRequired").and_then(Value::as_bool).unwrap_or(false);
     Some(Hello::Valid {
@@ -66,10 +72,11 @@ fn parse_hello(v: &Value) -> Option<Hello> {
 }
 
 impl GsxClient {
-    /// Connects to `ws://127.0.0.1:port`. `Err(Hello::Refused)` when nobody
-    /// answers. Otherwise the hello GSX sent (`Invalid` when it was missing
-    /// or malformed); a valid, open hello is followed by the subscription
-    /// and a `state.get`, so the snapshot arrives through `next`.
+    /// Connects to `ws://127.0.0.1:port` and reads the hello; sends nothing.
+    /// `Err(Hello::Refused)` when nobody answers. Otherwise the hello GSX
+    /// sent (`Invalid` when it was missing or malformed). Detection needs
+    /// only this; [`GsxClient::subscribe`] starts the stream, and
+    /// [`GsxClient::close`] says goodbye.
     pub async fn connect(port: u16) -> Result<(GsxClient, Hello), Hello> {
         let url = format!("ws://127.0.0.1:{port}");
         let ws = match tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(&url)).await {
@@ -86,20 +93,21 @@ impl GsxClient {
             Ok(Some(v)) => parse_hello(&v).unwrap_or(Hello::Invalid),
             _ => Hello::Invalid,
         };
-        if matches!(
-            hello,
-            Hello::Valid {
-                auth_required: false,
-                ..
-            }
-        ) {
-            let sub = json!({"type":"subscribe","id":"subscribe","channels":["state","prompts","toasts"]});
-            let get = json!({"type":"command","id":"state.get.1","verb":"state.get","args":{}});
-            if c.send(&sub).await.is_err() || c.send(&get).await.is_err() {
-                return Err(Hello::Refused);
-            }
-        }
         Ok((c, hello))
+    }
+
+    /// Subscribes to the `state` channel and asks for a snapshot, which then
+    /// arrives through `next`. Only for a valid, open hello.
+    pub async fn subscribe(&mut self) -> anyhow::Result<()> {
+        self.send(&json!({"type":"subscribe","id":"subscribe","channels":["state"]}))
+            .await?;
+        self.send(&json!({"type":"command","id":"state.get.1","verb":"state.get","args":{}}))
+            .await
+    }
+
+    /// Sends a Close frame (time-boxed) and drops the socket.
+    pub async fn close(mut self) {
+        let _ = tokio::time::timeout(SEND_TIMEOUT, self.ws.close(None)).await;
     }
 
     async fn send(&mut self, v: &Value) -> anyhow::Result<()> {
@@ -221,12 +229,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn valid_hello_subscribes_and_asks_for_state() {
+    async fn subscribe_asks_for_state_only_then_a_snapshot() {
         let port = server(|mut ws| async move {
             ws.send(Message::text(HELLO)).await.unwrap();
             let a = text(&mut ws).await;
             let b = text(&mut ws).await;
             assert_eq!(a["type"], "subscribe");
+            assert_eq!(a["channels"], json!(["state"]));
             assert_eq!(b["verb"], "state.get");
             ws.send(Message::text(r#"{"type":"snapshot","state":3}"#))
                 .await
@@ -241,7 +250,48 @@ mod tests {
             auth_required: false,
         };
         assert_eq!(hello, want);
+        c.subscribe().await.unwrap();
         assert_eq!(c.next().await.unwrap()["type"], "snapshot");
+    }
+
+    #[tokio::test]
+    async fn connect_sends_nothing_and_close_sends_a_close_frame() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let port = server(|mut ws| async move {
+            ws.send(Message::text(HELLO)).await.unwrap();
+            let mut got = vec![];
+            while let Some(Ok(m)) = ws.next().await {
+                got.push(m);
+            }
+            let _ = tx.send(got);
+        })
+        .await;
+        let (c, hello) = GsxClient::connect(port).await.unwrap_or_else(|_| panic!("refused"));
+        assert!(matches!(hello, Hello::Valid { .. }));
+        c.close().await;
+        let got = rx.await.unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(matches!(got[0], Message::Close(_)), "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn protocol_may_be_a_digit_string() {
+        let cases = [
+            (r#"{"type":"hello","protocol":"2","engine":"e"}"#, Some(2)),
+            (r#"{"type":"hello","protocol":"12","engine":"e"}"#, Some(12)),
+            (r#"{"type":"hello","protocol":"2a"}"#, None),
+            (r#"{"type":"hello","protocol":"-1"}"#, None),
+            (r#"{"type":"hello","protocol":""}"#, None),
+            (r#"{"type":"hello","protocol":2.5}"#, None),
+        ];
+        for (raw, want) in cases {
+            let v: Value = serde_json::from_str(raw).unwrap();
+            let got = match parse_hello(&v) {
+                Some(Hello::Valid { protocol, .. }) => Some(protocol),
+                _ => None,
+            };
+            assert_eq!(got, want, "{raw}");
+        }
     }
 
     #[tokio::test]
@@ -298,6 +348,7 @@ mod tests {
         })
         .await;
         let (mut c, _) = GsxClient::connect(port).await.unwrap_or_else(|_| panic!("refused"));
+        c.subscribe().await.unwrap();
         let r = c.command("gate.select", json!({"gate":"D 7"})).await.unwrap();
         assert!(!r.ok);
         assert_eq!(r.code.as_deref(), Some("NO_GATE"));
@@ -337,6 +388,7 @@ mod tests {
         })
         .await;
         let (mut c, _) = GsxClient::connect(port).await.unwrap_or_else(|_| panic!("refused"));
+        c.subscribe().await.unwrap();
         c.command("menu.close", json!({})).await.unwrap();
         assert_eq!(c.backlog.len(), BACKLOG_MAX);
         assert_eq!(c.next().await.unwrap()["n"], 300 - BACKLOG_MAX);

@@ -38,16 +38,17 @@ pub enum Hello {
 
 /// `installed`: the add-ons ini or the registry root exists. `couatl` is
 /// `L:FSDT_GSX_COUATL_STARTED`, None when unreadable (not MSFS, or the
-/// L:var definition was refused).
+/// L:var definition was refused). The socket is always asked: a valid hello
+/// wins over the L:var, which can read 0 while GSX runs. The L:var only
+/// tells a GSX that is not up yet (`NOT_RUNNING`) from one up without the
+/// Remote API (`NO_API`).
 pub fn classify(installed: bool, couatl: Option<bool>, hello: Hello) -> GsxCode {
     if !installed {
         return GsxCode::NotInstalled;
     }
-    if couatl == Some(false) {
-        return GsxCode::NotRunning;
-    }
     match hello {
-        Hello::Refused if couatl.is_none() => GsxCode::NotRunning,
+        Hello::Refused if couatl != Some(true) => GsxCode::NotRunning,
+        Hello::Invalid if couatl == Some(false) => GsxCode::NotRunning,
         Hello::Refused | Hello::Invalid => GsxCode::NoApi,
         Hello::Valid { protocol, .. } if protocol < MIN_PROTOCOL => GsxCode::NoApi,
         Hello::Valid {
@@ -156,8 +157,18 @@ mod tests {
     }
 
     #[test]
-    fn couatl_stopped_is_not_running() {
+    fn a_valid_hello_wins_over_couatl_reading_zero() {
         let c = classify(true, Some(false), valid(2, false));
+        assert_eq!(c, GsxCode::Ok);
+        let c = classify(true, Some(false), valid(2, true));
+        assert_eq!(c, GsxCode::Auth);
+    }
+
+    #[test]
+    fn couatl_stopped_without_a_socket_is_not_running() {
+        let c = classify(true, Some(false), Hello::Refused);
+        assert_eq!(c, GsxCode::NotRunning);
+        let c = classify(true, Some(false), Hello::Invalid);
         assert_eq!(c, GsxCode::NotRunning);
     }
 

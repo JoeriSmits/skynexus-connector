@@ -20,6 +20,8 @@ pub struct TicketManager {
     /// Gets `features` of every ticket fetched, so the TechLog tasks pick
     /// up the server switches on each renewal.
     features: Option<watch::Sender<Features>>,
+    /// Gets `(features.gsx, features.gsxRead)` of every ticket fetched.
+    gsx_features: Option<watch::Sender<Option<(bool, bool)>>>,
 }
 
 fn refresh_at(t: &Ticket) -> Instant {
@@ -33,6 +35,7 @@ impl TicketManager {
             credential,
             current: None,
             features: None,
+            gsx_features: None,
         }
     }
 
@@ -40,6 +43,13 @@ impl TicketManager {
     /// did not change (the TechLog tasks wait for the next ticket).
     pub fn with_features(mut self, tx: watch::Sender<Features>) -> Self {
         self.features = Some(tx);
+        self
+    }
+
+    /// Publishes `(gsx, gsxRead)` of every fetched ticket on `tx`, even when
+    /// unchanged (the GSX runner waits for the next ticket after a 503).
+    pub fn with_gsx_features(mut self, tx: watch::Sender<Option<(bool, bool)>>) -> Self {
+        self.gsx_features = Some(tx);
         self
     }
 
@@ -60,6 +70,9 @@ impl TicketManager {
         }
         if let Some(f) = &self.features {
             f.send_replace(t.features);
+        }
+        if let Some(g) = &self.gsx_features {
+            g.send_replace(Some((t.gsx, t.gsx_read)));
         }
         self.current = Some(t.clone());
         Ok(t)
@@ -196,6 +209,23 @@ mod tests {
             rx.has_changed().unwrap(),
             "a renewal is published even when the value is the same"
         );
+    }
+
+    #[tokio::test]
+    async fn every_fetched_ticket_publishes_its_gsx_features() {
+        let features = serde_json::json!({ "gsx": true, "gsxRead": false });
+        let body = serde_json::json!({ "ticket": "o", "expires_in": 900, "features": features });
+        let s = server(body).await;
+        let (tx, mut rx) = watch::channel(None);
+        let api = ApiClient::new(&s.uri());
+        let mut m = TicketManager::new(api, "cred-1".into()).with_gsx_features(tx);
+        let t0 = Instant::now();
+        m.valid(t0).await.unwrap();
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(*rx.borrow_and_update(), Some((true, false)));
+        m.invalidate();
+        m.valid(t0).await.unwrap();
+        assert!(rx.has_changed().unwrap(), "a renewal is published");
     }
 
     #[tokio::test]

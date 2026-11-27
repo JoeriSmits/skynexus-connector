@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::gsx::block::{GsxBlock, GsxParkings};
+
 /// The schema version this connector speaks.
 pub const FRAME_VERSION: u8 = 1;
 
@@ -113,6 +115,15 @@ pub struct Frame {
     pub own: Own,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic: Option<Vec<Traffic>>,
+    /// GSX block: absent, `null` (GSX went away) or the block.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::gsx::block::double_option"
+    )]
+    pub gsx: Option<Option<GsxBlock>>,
+    #[serde(rename = "gsxParkings", default, skip_serializing_if = "Option::is_none")]
+    pub gsx_parkings: Option<GsxParkings>,
 }
 
 impl Frame {
@@ -123,6 +134,8 @@ impl Frame {
             sim,
             own,
             traffic: None,
+            gsx: None,
+            gsx_parkings: None,
         }
     }
 
@@ -225,6 +238,13 @@ impl Frame {
             own: OwnWithTl<'a>,
             #[serde(skip_serializing_if = "Option::is_none")]
             traffic: &'a Option<Vec<Traffic>>,
+            #[serde(
+                skip_serializing_if = "Option::is_none",
+                serialize_with = "crate::gsx::block::double_option::serialize"
+            )]
+            gsx: &'a Option<Option<GsxBlock>>,
+            #[serde(rename = "gsxParkings", skip_serializing_if = "Option::is_none")]
+            gsx_parkings: &'a Option<GsxParkings>,
         }
         let view = View {
             v: self.v,
@@ -232,6 +252,8 @@ impl Frame {
             sim: self.sim,
             own: OwnWithTl { own: &self.own, tl },
             traffic: &self.traffic,
+            gsx: &self.gsx,
+            gsx_parkings: &self.gsx_parkings,
         };
         serde_json::to_string(&view).expect("frame serialises")
     }

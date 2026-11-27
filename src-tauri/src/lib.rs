@@ -4,13 +4,15 @@
 //! Layout: `frame` (wire schema), `api` (web app routes), `pairing`,
 //! `credentials`, `ticket`, `relay`, `sim` (adapters and pacing), `engine`
 //! (lifetimes), `tray` (UI), `config` (flags), `msfs_launch` (start and stop
-//! with MSFS), `logs` (the log file), `techlog` (the TechLog link).
+//! with MSFS), `logs` (the log file), `techlog` (the TechLog link), `gsx`
+//! (GSX Pro).
 
 pub mod api;
 pub mod config;
 pub mod credentials;
 pub mod engine;
 pub mod frame;
+pub mod gsx;
 pub mod logs;
 pub mod msfs_launch;
 pub mod pairing;
@@ -67,6 +69,10 @@ pub fn run() {
         remove_msfs_entries();
         return;
     }
+    if let Some(path) = cfg.gsx_record.clone() {
+        run_gsx_record(&path);
+        return;
+    }
     log::info!(
         "SkyNexus Connector {} ({}{})",
         env!("CARGO_PKG_VERSION"),
@@ -90,6 +96,40 @@ pub fn run() {
         return;
     }
     run_tray(&rt, engine);
+}
+
+/// The release build is a GUI-subsystem process with no console of its own;
+/// attach to the one it was started from so stdout and Ctrl+C work.
+#[cfg(windows)]
+fn attach_parent_console() {
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    // ATTACH_PARENT_PROCESS = 0xFFFFFFFF. Failure (no parent console) is fine.
+    unsafe {
+        AttachConsole(0xFFFF_FFFF);
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
+/// `--gsx-record FILE`: headless capture of GSX's Remote API, no tray,
+/// pairing or relay. Stops on Ctrl+C.
+fn run_gsx_record(path: &std::path::Path) {
+    attach_parent_console();
+    let ini = gsx::port::ini_path();
+    let port = gsx::port::remote_port(&ini);
+    println!("gsx-record: Remote API port {port} (from {})", ini.display());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    if let Err(e) = rt.block_on(gsx::record::run(path, port)) {
+        eprintln!("gsx-record: {e:#}");
+        std::process::exit(1);
+    }
 }
 
 /// Logs each change of the tray lines, in both modes.
@@ -166,6 +206,10 @@ fn on_second_copy(app: &tauri::AppHandle, argv: &[String]) {
 }
 
 async fn run_headless(engine: Arc<Engine>) {
+    // Respect a "Read GSX" the tray turned off.
+    if let Some(dir) = config::app_config_dir() {
+        engine.set_read_gsx(gsx::setting::is_on(&dir));
+    }
     engine.start();
     tokio::spawn(log_status(engine.clone()));
     if !engine.config().offline && !engine.current().signed_in() {
@@ -211,6 +255,12 @@ fn run_tray(rt: &tokio::runtime::Runtime, engine: Arc<Engine>) {
                 .app_config_dir()
                 .is_ok_and(|dir| techlog::setting::is_on(&dir));
             setup_engine.set_read_techlog(techlog_on);
+            // "Read GSX" is on unless the user turned it off.
+            let gsx_on = app
+                .path()
+                .app_config_dir()
+                .map_or(true, |dir| gsx::setting::is_on(&dir));
+            setup_engine.set_read_gsx(gsx_on);
             tray::build(app, setup_engine.clone(), entry.zip(msfs_on))?;
             setup_engine.start();
             tauri::async_runtime::spawn(log_status(setup_engine.clone()));

@@ -119,6 +119,8 @@ pub const REQ_TRAFFIC_HELICOPTER: u32 = 3;
 pub const REQ_SIM_STATE: u32 = 4;
 pub const DEF_TITLE: u32 = 3;
 pub const REQ_TITLE: u32 = 5;
+pub const DEF_GSX: u32 = 4;
+pub const REQ_GSX: u32 = 6;
 
 /// Traffic radius in metres (the API maximum is 200 000).
 pub const TRAFFIC_RADIUS_M: u32 = 80_000;
@@ -199,6 +201,32 @@ pub fn decode_title(d: &[u8]) -> Option<String> {
     let end = raw.iter().position(|c| *c == 0).unwrap_or(raw.len());
     let s = String::from_utf8_lossy(&raw[..end]).trim().to_string();
     (!s.is_empty()).then_some(s)
+}
+
+/// GSX Pro's L:vars, in a definition of their own so that a failure here
+/// never touches own-ship reading: couatl started, passengers boarding in
+/// total, passengers. L:vars are added by name with the `L:` prefix (SU12+).
+pub const GSX_DATUMS: [Datum; 3] = [
+    f64d("L:FSDT_GSX_COUATL_STARTED", "number", 0.0),
+    f64d("L:FSDT_GSX_NUMPASSENGERS_BOARDING_TOTAL", "number", 0.0),
+    f64d("L:FSDT_GSX_NUMPASSENGERS", "number", 0.0),
+];
+pub const GSX_DATA_LEN: usize = 3 * 8;
+
+/// A GSX L:var block as (couatl started, pax boarding total, pax). Counts
+/// are rounded and clamped; NaN or negative reads as 0.
+pub fn decode_gsx(d: &[u8]) -> Option<(bool, u32, u32)> {
+    if d.len() < GSX_DATA_LEN {
+        return None;
+    }
+    let count = |v: f64| {
+        if v.is_finite() && v > 0.0 {
+            v.round().min(u32::MAX as f64) as u32
+        } else {
+            0
+        }
+    };
+    Some((f64_at(d, 0)? >= 0.5, count(f64_at(d, 8)?), count(f64_at(d, 16)?)))
 }
 
 fn u32_at(b: &[u8], off: usize) -> Option<u32> {
@@ -401,6 +429,16 @@ pub(crate) mod tests {
         }
         m.extend_from_slice(data);
         m
+    }
+
+    #[test]
+    fn gsx_block_decodes_and_clamps() {
+        let mut d = Vec::new();
+        for v in [1.0f64, 12.4, -3.0] {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(decode_gsx(&d), Some((true, 12, 0)));
+        assert_eq!(decode_gsx(&d[..16]), None);
     }
 
     #[test]

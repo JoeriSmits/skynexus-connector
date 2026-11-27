@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, sleep_until, timeout, Instant};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -184,6 +184,9 @@ pub struct Relay {
     pub frames: watch::Receiver<FrameSlot>,
     pub state: Arc<watch::Sender<RelayState>>,
     pub timing: RelayTiming,
+    /// Where `cmd` messages from the account's viewers go (the GSX runner).
+    /// Each with the time it arrived, so a late one can be dropped.
+    pub cmds: Option<mpsc::Sender<(Instant, Value)>>,
 }
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -315,6 +318,24 @@ impl Relay {
         }
     }
 
+    /// A text message other than `ready`: a `cmd` goes to the GSX runner
+    /// (dropped when it is not keeping up); anything else, and anything
+    /// that is not JSON, is only logged. Never ends the session.
+    fn on_text(&self, t: &str) {
+        let cmd = serde_json::from_str::<Value>(t)
+            .ok()
+            .filter(|v| v.get("type").and_then(Value::as_str) == Some("cmd"));
+        match (cmd, &self.cmds) {
+            (Some(v), Some(tx)) => {
+                if tx.try_send((Instant::now(), v)).is_err() {
+                    log::debug!("relay: a command was dropped");
+                }
+            }
+            (Some(_), None) => log::debug!("relay: no one takes commands"),
+            (None, _) => log::debug!("relay says: {t}"),
+        }
+    }
+
     /// Sends the auth message and waits for `ready`.
     async fn authenticate(&self, mut ws: Ws, ticket: &str) -> Result<Ws, SessionEnd> {
         if let Err(e) = ws.send(Message::text(auth_message(ticket))).await {
@@ -375,7 +396,7 @@ impl Relay {
                             refresh_at = Instant::now() + self.tickets.refresh_in(std::time::Instant::now());
                             log::info!("relay: ticket renewed on the open connection");
                         }
-                        Some(Ok(Message::Text(t))) => log::debug!("relay says: {}", t.as_str()),
+                        Some(Ok(Message::Text(t))) => self.on_text(t.as_str()),
                         Some(Ok(_)) => {}
                     }
                 }
@@ -436,7 +457,6 @@ mod tests {
     use base64::Engine as _;
     use clap::Parser;
     use tokio::net::TcpListener;
-    use tokio::sync::mpsc;
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -597,6 +617,7 @@ mod tests {
             tickets: TicketManager::new(ApiClient::new(api_base), "cred".into()),
             frames,
             state: Arc::new(state_tx),
+            cmds: None,
             timing: RelayTiming {
                 backoff_min: Duration::from_millis(20),
                 backoff_max: Duration::from_millis(100),
@@ -656,6 +677,59 @@ mod tests {
 
     fn in_15_min() -> u64 {
         now_ms() / 1000 + 900
+    }
+
+    /// A relay that acks the auth, then sends `say` and records every
+    /// frame the connector sends.
+    async fn talking_relay(say: Vec<String>) -> (String, mpsc::UnboundedReceiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _auth = ws.next().await;
+            let ready = r#"{"type":"ready","role":"connector","exp":1}"#;
+            ws.send(Message::text(ready)).await.unwrap();
+            for m in say {
+                ws.send(Message::text(m)).await.unwrap();
+            }
+            while let Some(Ok(m)) = ws.next().await {
+                if let Message::Text(t) = m {
+                    let _ = tx.send(t.to_string());
+                }
+            }
+        });
+        (format!("ws://{addr}"), rx)
+    }
+
+    #[tokio::test]
+    async fn cmd_messages_go_to_the_gsx_runner_and_nothing_else_does() {
+        let exp = in_15_min();
+        let api = tickets(exp, exp).await;
+        let say = vec![
+            // Not JSON, and a lone surrogate serde refuses: both ignored.
+            "not json".to_string(),
+            r#"{"type":"cmd","id":"\ud800","verb":"gsx.simbrief","args":{}}"#.to_string(),
+            r#"{"type":"status","viewers":1}"#.to_string(),
+            r#"{"type":"cmd","id":"c1","verb":"gsx.simbrief","args":{}}"#.to_string(),
+        ];
+        let (relay_url, mut got) = talking_relay(say).await;
+        let (ftx, frx) = watch::channel(None);
+        let (mut relay, mut state) = relay_for(&api.uri(), &relay_url, frx);
+        let (ctx, mut crx) = mpsc::channel(4);
+        relay.cmds = Some(ctx);
+        let task = tokio::spawn(relay.run());
+        state.wait_for(|s| *s == RelayState::Connected).await.unwrap();
+        let (_, cmd) = timeout(Duration::from_secs(5), crx.recv()).await.unwrap().unwrap();
+        assert_eq!(cmd["id"], "c1");
+        assert!(crx.try_recv().is_err(), "only the cmd");
+        // The session is still up and streams.
+        ftx.send_replace(Some(Arc::from(r#"{"n":1}"#)));
+        let frame = timeout(Duration::from_secs(5), got.recv()).await.unwrap().unwrap();
+        assert_eq!(frame, r#"{"n":1}"#);
+        assert_eq!(*state.borrow(), RelayState::Connected);
+        task.abort();
     }
 
     #[tokio::test]

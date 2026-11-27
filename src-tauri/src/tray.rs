@@ -1,5 +1,5 @@
 //! The tray menu: status, Sign in / Sign out, Open SkyNexus, Start with MSFS
-//! (Windows), Read TechLog, Start at login, Open logs, Quit.
+//! (Windows), Read TechLog, Read GSX, Start at login, Open logs, Quit.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,6 +10,7 @@ use tauri::{App, AppHandle, Manager, Wry};
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::engine::{Auth, Engine, Status};
+use crate::gsx::setting as gsx_setting;
 use crate::techlog::setting as techlog_setting;
 use crate::{logs, msfs_launch};
 
@@ -111,6 +112,21 @@ pub fn build(app: &App, engine: Arc<Engine>, msfs: Option<MsfsEntry>) -> tauri::
     let techlog_dir = handle.path().app_config_dir().ok();
     let techlog_on = techlog_dir.as_deref().is_some_and(techlog_setting::is_on);
     let read_techlog = CheckMenuItem::with_id(handle, "read_techlog", "Read TechLog", true, techlog_on, None::<&str>)?;
+    // On by default: only a saved "off" turns it off. Windows only, like
+    // "Start with MSFS": GSX runs with MSFS, which runs only there.
+    let gsx_on = techlog_dir.as_deref().is_none_or(gsx_setting::is_on);
+    let read_gsx = if cfg!(windows) {
+        Some(CheckMenuItem::with_id(
+            handle,
+            "read_gsx",
+            "Read GSX",
+            true,
+            gsx_on,
+            None::<&str>,
+        )?)
+    } else {
+        None
+    };
     let open_logs = MenuItem::with_id(handle, "logs", "Open logs", true, None::<&str>)?;
     let quit = MenuItem::with_id(handle, "quit", "Quit SkyNexus Connector", true, None::<&str>)?;
     let separator_top = PredefinedMenuItem::separator(handle)?;
@@ -126,9 +142,12 @@ pub fn build(app: &App, engine: Arc<Engine>, msfs: Option<MsfsEntry>) -> tauri::
     if let Some(item) = &with_msfs {
         entries.push(item);
     }
+    entries.push(&read_techlog);
+    if let Some(item) = &read_gsx {
+        entries.push(item);
+    }
     entries.extend([
-        &read_techlog as &dyn tauri::menu::IsMenuItem<Wry>,
-        &autostart,
+        &autostart as &dyn tauri::menu::IsMenuItem<Wry>,
         &open_logs,
         &separator_bottom,
         &quit,
@@ -146,6 +165,7 @@ pub fn build(app: &App, engine: Arc<Engine>, msfs: Option<MsfsEntry>) -> tauri::
     let on_menu = engine.clone();
     let autostart_item = autostart.clone();
     let read_techlog_item = read_techlog.clone();
+    let read_gsx_item = read_gsx.clone();
     let msfs_paths = msfs.map(|(paths, _)| paths);
     let tray = builder
         .on_menu_event(move |app: &AppHandle, event| match event.id().as_ref() {
@@ -195,6 +215,24 @@ pub fn build(app: &App, engine: Arc<Engine>, msfs: Option<MsfsEntry>) -> tauri::
                 let now = if saved { on } else { !on };
                 on_menu.set_read_techlog(now);
                 let _ = read_techlog_item.set_checked(now);
+            }
+            "read_gsx" => {
+                let on = !techlog_dir.as_deref().is_none_or(gsx_setting::is_on);
+                let saved = techlog_dir
+                    .as_deref()
+                    .is_some_and(|dir| match gsx_setting::set(dir, on) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            log::warn!("read GSX: cannot save the choice: {e}");
+                            false
+                        }
+                    });
+                // Without a saved choice the switch would not survive a restart: leave it as it was.
+                let now = if saved { on } else { !on };
+                on_menu.set_read_gsx(now);
+                if let Some(item) = &read_gsx_item {
+                    let _ = item.set_checked(now);
+                }
             }
             "logs" => match logs::log_dir() {
                 Some(dir) => {

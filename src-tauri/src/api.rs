@@ -9,13 +9,13 @@
 //!   400 `{error}` with `authorization_pending`, `slow_down`, `access_denied`,
 //!   `expired_token` or `invalid_grant`; 429 `slow_down`; 5xx transient.
 //! - `POST /api/connector/ticket` with `Authorization: Bearer snc_...`
-//!   -> 200 `{ticket, role: "connector", expires_in: 900, expires_at: ISO, features?: {techlog}}`;
+//!   -> 200 `{ticket, role: "connector", expires_in: 900, expires_at: ISO, features?: {techlog, techlogRead}}`;
 //!   401 `invalid_credential` | `revoked` (signed out); 403 `not_enabled`
 //!   (keep the credential, retry later); 429; 503.
 //! - `DELETE /api/connector/devices` with the bearer credential: sign-out
 //!   self-revoke, idempotent.
 //! - `POST /api/connector/techlog` with the bearer credential and
-//!   `{health, snapshot?}` -> 204; 401 `invalid_credential` | `revoked`;
+//!   `{health, snapshot?}` or `{mode: "presence", health, present, simAircraft}` -> 204; 401 `invalid_credential` | `revoked`;
 //!   422 `{error: "invalid_body", path}`; 429; 503 `disabled` (kill switch)
 //!   or another 503 (transient).
 
@@ -266,6 +266,9 @@ pub struct Features {
     /// `features.techlog`: the server allows the TechLog link (the kill
     /// switch). Nothing TechLog runs without it.
     pub techlog: bool,
+    /// `features.techlogRead`: the pilot turned TechLog on in the EFB, so
+    /// the full reader runs without the tray switch.
+    pub techlog_read: bool,
 }
 
 impl Features {
@@ -277,6 +280,7 @@ impl Features {
         };
         Features {
             techlog: flag("techlog"),
+            techlog_read: flag("techlogRead"),
         }
     }
 }
@@ -727,6 +731,23 @@ mod tests {
         assert!(!t(r#"{"ticket":"opaque","features":null}"#));
         assert!(!t(r#"{"ticket":"opaque","features":{"techlog":false}}"#));
         assert!(t(r#"{"ticket":"opaque","features":{"techlog":true}}"#));
+    }
+
+    #[test]
+    fn ticket_features_techlog_read_defaults_to_false() {
+        let r = Instant::now();
+        let f = |body: &str| parse_ticket(body, 0, r).unwrap().features;
+        let read = |body: &str| f(body).techlog_read;
+        assert!(!read(r#"{"ticket":"opaque"}"#), "missing features");
+        assert!(!read(r#"{"ticket":"opaque","features":{"techlog":true}}"#));
+        assert!(!read(r#"{"ticket":"opaque","features":{"techlogRead":1}}"#));
+        assert!(!read(r#"{"ticket":"opaque","features":{"techlogRead":null}}"#));
+        let both = r#"{"ticket":"opaque","features":{"techlog":true,"techlogRead":true}}"#;
+        let want = Features {
+            techlog: true,
+            techlog_read: true,
+        };
+        assert_eq!(f(both), want);
     }
 
     #[tokio::test]

@@ -51,8 +51,8 @@ struct Key {
 }
 
 /// Whether the full reader runs instead (it reports presence itself).
-pub fn full_reader_on(read_switch: bool, _features: Features) -> bool {
-    read_switch
+pub fn full_reader_on(read_switch: bool, features: Features) -> bool {
+    read_switch || features.techlog_read
 }
 
 /// The title as the server takes it: trimmed, at most 120 characters, None
@@ -99,6 +99,10 @@ pub async fn run(mut cfg: PresenceCfg, client: TechlogClient, api: ApiClient) {
         let sim = *cfg.sim.borrow_and_update();
         let title = cfg.aircraft.borrow_and_update().clone();
         let reader = full_reader_on(switch, features);
+        if credential != credential_seen {
+            // Another account (or a re-pair): its own refusal state.
+            refused = None;
+        }
         if credential != credential_seen || reader {
             // Another account, or the reader took over: send the state again.
             last = None;
@@ -141,7 +145,7 @@ pub async fn run(mut cfg: PresenceCfg, client: TechlogClient, api: ApiClient) {
                 Ok(()) => last = Some(k),
                 Err(ApiError::Unauthorized) => {
                     log::warn!("techlog presence: SkyNexus refused the credential; not sending until it changes");
-                    refused = Some(credential);
+                    refused = Some(credential.clone());
                 }
                 Err(ApiError::InvalidBody { path }) => {
                     log::warn!("techlog presence: SkyNexus refused the body at {path}; not resending this state");
@@ -162,7 +166,9 @@ pub async fn run(mut cfg: PresenceCfg, client: TechlogClient, api: ApiClient) {
                 }
             }
         }
-        if server_off || refused.is_some() {
+        // Blocked now: the top of the loop waits for a change, so no spin.
+        // Otherwise the sleep below always runs before the next ping.
+        if server_off || refused.as_ref() == Some(&credential) {
             continue;
         }
         tokio::select! {
@@ -225,7 +231,10 @@ mod tests {
     }
 
     fn on() -> Features {
-        Features { techlog: true }
+        Features {
+            techlog: true,
+            techlog_read: false,
+        }
     }
 
     fn start(tl: &str, app: &MockServer, f: Features) -> H {
@@ -372,6 +381,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_opt_in_from_the_efb_hands_over_to_the_reader() {
+        let tl = techlog(&fixture("ping.json")).await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let h = start(&tl.uri(), &a, on());
+        until("a post", async || posts(&a).await.len() == 1).await;
+        let read = Features {
+            techlog_read: true,
+            ..on()
+        };
+        h.features.send_replace(read);
+        quiet().await;
+        let n = hits(&tl, "/api/ping").await;
+        quiet().await;
+        assert_eq!(hits(&tl, "/api/ping").await, n, "presence steps aside");
+        // kill switch with the opt-in still set: neither runs
+        let killed = Features {
+            techlog: false,
+            techlog_read: true,
+        };
+        h.features.send_replace(killed);
+        quiet().await;
+        assert_eq!(hits(&tl, "/api/ping").await, n);
+        assert_eq!(posts(&a).await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn the_kill_switch_stops_it() {
         let tl = techlog(&fixture("ping.json")).await;
         let a = app(ResponseTemplate::new(204)).await;
@@ -422,6 +457,38 @@ mod tests {
         assert_eq!(hits(&tl, "/api/ping").await, 1);
         h.features.send_replace(on());
         until("2nd post", async || posts(&a).await.len() == 2).await;
+    }
+
+    #[tokio::test]
+    async fn a_new_credential_after_a_401_posts_without_spinning() {
+        let tl = techlog(&fixture("ping.json")).await;
+        let a = MockServer::start().await;
+        let body = json!({ "error": "revoked" });
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(body))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&a)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204))
+            .with_priority(5)
+            .mount(&a)
+            .await;
+        let h = start(&tl.uri(), &a, on());
+        until("the 401", async || posts(&a).await.len() == 1).await;
+        quiet().await;
+        assert_eq!(hits(&tl, "/api/ping").await, 1, "waits while refused");
+        h.credential.send_replace(Some("snc_2".into()));
+        until("2nd post", async || posts(&a).await.len() == 2).await;
+        let reqs = a.received_requests().await.unwrap();
+        assert_eq!(reqs[1].headers["authorization"], "Bearer snc_2");
+        // every is 10 ms: about 12 pings in 120 ms; a spin is hundreds
+        let n = hits(&tl, "/api/ping").await;
+        quiet().await;
+        let more = hits(&tl, "/api/ping").await - n;
+        assert!(more <= 20, "{more} pings in 120 ms");
+        assert_eq!(posts(&a).await.len(), 2, "unchanged state");
     }
 
     #[test]

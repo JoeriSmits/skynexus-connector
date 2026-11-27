@@ -203,7 +203,8 @@ impl Engine {
     }
 
     /// The credential for the TechLog runner. Signing out also forgets the
-    /// last ticket's `features.techlog`, so another account waits for its own.
+    /// last ticket's `features` (`techlog` and `techlogRead`), so another
+    /// account waits for its own.
     fn set_credential(&self, c: Option<&Credential>) {
         if c.is_none() {
             self.techlog_features.send_replace(Features::default());
@@ -704,7 +705,11 @@ mod tests {
             credential: "snc_kept".into(),
             device_id: None,
         });
-        engine.techlog_features.send_replace(Features { techlog: true });
+        let both = Features {
+            techlog: true,
+            techlog_read: true,
+        };
+        engine.techlog_features.send_replace(both);
         engine.sign_out();
         assert!(
             *engine.techlog_features.borrow() == Features::default(),

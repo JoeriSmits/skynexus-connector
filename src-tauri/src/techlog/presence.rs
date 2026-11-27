@@ -4,7 +4,12 @@
 //! TechLog on.
 //!
 //! - Pings every 60 s; the next ping is timed from the end of the previous
-//!   one. A change of the aircraft title pings at once.
+//!   one. A change of the aircraft title pings at once. When a sim connects
+//!   without a title yet, the first ping waits up to 3 s for it, so loading
+//!   a flight posts once, not null and then the title.
+//! - A failed post (network, 5xx, 429) holds posting for a doubling backoff
+//!   from 60 s, capped at 10 min (or `Retry-After` when longer), reset on
+//!   success. A wake-up for a new title or ticket does not cut it short.
 //! - POSTs `{mode: "presence", health, present, simAircraft}` only when
 //!   (present, techlogVersion, simAircraft) changed since SkyNexus last
 //!   accepted it. No tech log data leaves the PC.
@@ -17,7 +22,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::sync::watch;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout, Instant};
 
 use super::client::{Code, TechlogClient};
 use super::runner::{describe, health, valid_version, MAX_RETRY_AFTER};
@@ -25,6 +30,10 @@ use crate::api::{ApiClient, ApiError, Features};
 
 /// Between pings.
 pub const EVERY: Duration = Duration::from_secs(60);
+/// How long the first ping after a sim connects waits for the title.
+pub const TITLE_GRACE: Duration = Duration::from_secs(3);
+/// The longest backoff after failed posts.
+pub const BACKOFF_MAX: Duration = Duration::from_secs(600);
 /// The longest `simAircraft` the server accepts, in characters.
 pub const MAX_AIRCRAFT_CHARS: usize = 120;
 
@@ -39,7 +48,17 @@ pub struct PresenceCfg {
     pub sim: watch::Receiver<bool>,
     /// The loaded aircraft's title (MSFS only).
     pub aircraft: watch::Receiver<Option<String>>,
+    /// Between pings, and the first backoff step.
     pub every: Duration,
+    /// See [`TITLE_GRACE`].
+    pub title_grace: Duration,
+    /// See [`BACKOFF_MAX`].
+    pub backoff_max: Duration,
+}
+
+/// The next backoff step: `every` first, then doubling, capped at `max`.
+fn next_backoff(prev: Option<Duration>, every: Duration, max: Duration) -> Duration {
+    prev.map_or(every, |b| b.saturating_mul(2)).min(max)
 }
 
 /// What the presence post reports; a post is due when it changed.
@@ -92,6 +111,11 @@ pub async fn run(mut cfg: PresenceCfg, client: TechlogClient, api: ApiClient) {
     let mut last_code: Option<Code> = None;
     let mut failing: Option<std::mem::Discriminant<ApiError>> = None;
     let mut credential_seen: Option<String> = None;
+    // The last backoff step, and no post before this.
+    let mut backoff: Option<Duration> = None;
+    let mut hold_until: Option<Instant> = None;
+    // Whether the sim was on at the last ping (for the title grace).
+    let mut sim_seen = false;
     loop {
         let credential = cfg.credential.borrow_and_update().clone();
         let features = *cfg.features.borrow_and_update();
@@ -112,6 +136,9 @@ pub async fn run(mut cfg: PresenceCfg, client: TechlogClient, api: ApiClient) {
         let blocked_cred = credential.is_none() || (refused.is_some() && credential == refused);
         if !sim || blocked_cred || !features.techlog || reader || server_off {
             last_code = None;
+            if !sim {
+                sim_seen = false;
+            }
             tokio::select! {
                 r = cfg.credential.changed() => if r.is_err() { return },
                 r = cfg.read_switch.changed() => if r.is_err() { return },
@@ -127,6 +154,15 @@ pub async fn run(mut cfg: PresenceCfg, client: TechlogClient, api: ApiClient) {
             continue;
         }
         let credential = credential.expect("checked above");
+        let mut title = title;
+        if !sim_seen {
+            sim_seen = true;
+            if title.is_none() {
+                // MSFS answers the title just after the flight loads.
+                let _ = timeout(cfg.title_grace, cfg.aircraft.wait_for(Option::is_some)).await;
+                title = cfg.aircraft.borrow_and_update().clone();
+            }
+        }
 
         let (code, version) = client.probe().await;
         if last_code.as_ref() != Some(&code) {
@@ -135,14 +171,24 @@ pub async fn run(mut cfg: PresenceCfg, client: TechlogClient, api: ApiClient) {
         }
         let k = key(&code, version, title.as_deref());
         let mut wait = cfg.every;
-        if last.as_ref() != Some(&k) && refused_key.as_ref() != Some(&k) {
+        let now = Instant::now();
+        let held = hold_until.is_some_and(|t| now < t);
+        if held {
+            // Wake at the deadline at the latest, so the post is not late.
+            wait = wait.min(hold_until.expect("held").duration_since(now));
+        }
+        if !held && last.as_ref() != Some(&k) && refused_key.as_ref() != Some(&k) {
             refused_key = None;
             let result = api.post_techlog(&credential, &body(&code, &k)).await;
             if !matches!(&result, Err(e) if failing == Some(std::mem::discriminant(e))) {
                 failing = None;
             }
             match result {
-                Ok(()) => last = Some(k),
+                Ok(()) => {
+                    last = Some(k);
+                    backoff = None;
+                    hold_until = None;
+                }
                 Err(ApiError::Unauthorized) => {
                     log::warn!("techlog presence: SkyNexus refused the credential; not sending until it changes");
                     refused = Some(credential.clone());
@@ -162,7 +208,11 @@ pub async fn run(mut cfg: PresenceCfg, client: TechlogClient, api: ApiClient) {
                         log::warn!("techlog presence: cannot post ({e}); retrying");
                         failing = Some(kind);
                     }
-                    wait = wait.max(e.retry_after().unwrap_or_default().min(MAX_RETRY_AFTER));
+                    let step = next_backoff(backoff, cfg.every, cfg.backoff_max);
+                    backoff = Some(step);
+                    let ra = e.retry_after().unwrap_or_default().min(MAX_RETRY_AFTER);
+                    wait = step.max(ra);
+                    hold_until = Some(Instant::now() + wait);
                 }
             }
         }
@@ -238,11 +288,22 @@ mod tests {
     }
 
     fn start(tl: &str, app: &MockServer, f: Features) -> H {
+        start_with(tl, app, f, true, Some(A320), Duration::from_secs(1))
+    }
+
+    fn start_with(
+        tl: &str,
+        app: &MockServer,
+        f: Features,
+        sim_on: bool,
+        title: Option<&str>,
+        backoff_max: Duration,
+    ) -> H {
         let (credential, credential_rx) = watch::channel(Some("snc_1".to_string()));
         let (features, features_rx) = watch::channel(f);
         let (switch, switch_rx) = watch::channel(false);
-        let (sim, sim_rx) = watch::channel(true);
-        let (aircraft, aircraft_rx) = watch::channel(Some(A320.to_string()));
+        let (sim, sim_rx) = watch::channel(sim_on);
+        let (aircraft, aircraft_rx) = watch::channel(title.map(str::to_string));
         let cfg = PresenceCfg {
             credential: credential_rx,
             features: features_rx,
@@ -250,6 +311,8 @@ mod tests {
             sim: sim_rx,
             aircraft: aircraft_rx,
             every: MS,
+            title_grace: Duration::from_millis(400),
+            backoff_max,
         };
         let url = Url::parse(tl).unwrap();
         let client = TechlogClient::with_timeout(url, Duration::from_millis(500));
@@ -489,6 +552,106 @@ mod tests {
         let more = hits(&tl, "/api/ping").await - n;
         assert!(more <= 20, "{more} pings in 120 ms");
         assert_eq!(posts(&a).await.len(), 2, "unchanged state");
+    }
+
+    #[tokio::test]
+    async fn a_flight_load_posts_once_with_the_title() {
+        let tl = techlog(&fixture("ping.json")).await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let f = on();
+        let s = Duration::from_secs(1);
+        let h = start_with(&tl.uri(), &a, f, false, None, s);
+        quiet().await;
+        // the sim connects; the title follows 50 ms later
+        h.sim.send_replace(true);
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(hits(&tl, "/api/ping").await, 0, "waits for the title");
+        h.aircraft.send_replace(Some(A320.into()));
+        until("a post", async || !posts(&a).await.is_empty()).await;
+        quiet().await;
+        let sent = posts(&a).await;
+        assert_eq!(sent.len(), 1, "not null, then the title");
+        assert_eq!(sent[0]["simAircraft"], A320);
+
+        // no title at all (X-Plane): null after the grace, once
+        let tl = techlog(&fixture("ping.json")).await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let _h = start_with(&tl.uri(), &a, on(), true, None, s);
+        sleep(Duration::from_millis(200)).await;
+        assert!(posts(&a).await.is_empty(), "inside the grace");
+        until("a post", async || !posts(&a).await.is_empty()).await;
+        assert!(posts(&a).await[0]["simAircraft"].is_null());
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_not_cut_short_by_a_new_title() {
+        let tl = techlog(&fixture("ping.json")).await;
+        let a = MockServer::start().await;
+        let limited = ResponseTemplate::new(429).insert_header("retry-after", "1");
+        Mock::given(method("POST"))
+            .respond_with(limited)
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&a)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204))
+            .with_priority(5)
+            .mount(&a)
+            .await;
+        let h = start(&tl.uri(), &a, on());
+        until("the 429", async || posts(&a).await.len() == 1).await;
+        let t0 = std::time::Instant::now();
+        for i in 0..5 {
+            h.aircraft.send_replace(Some(format!("PMDG 737-{i}00")));
+            sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(posts(&a).await.len(), 1, "held for Retry-After");
+        until("the post after it", async || posts(&a).await.len() == 2).await;
+        assert!(t0.elapsed() >= Duration::from_millis(850));
+        assert_eq!(posts(&a).await[1]["simAircraft"], "PMDG 737-400");
+    }
+
+    #[tokio::test]
+    async fn failed_posts_back_off_and_success_resets() {
+        let tl = techlog(&fixture("ping.json")).await;
+        let a = MockServer::start().await;
+        let body = json!({ "error": "unavailable" });
+        let down = ResponseTemplate::new(503).set_body_json(body);
+        Mock::given(method("POST"))
+            .respond_with(down)
+            .up_to_n_times(5)
+            .with_priority(1)
+            .mount(&a)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204))
+            .with_priority(5)
+            .mount(&a)
+            .await;
+        // steps 10, 20, 40, 80, 80 ms: about 230 ms for 5 failures
+        let cap = Duration::from_millis(80);
+        let h = start_with(&tl.uri(), &a, on(), true, Some(A320), cap);
+        let t0 = std::time::Instant::now();
+        until("six posts", async || posts(&a).await.len() == 6).await;
+        let took = t0.elapsed();
+        assert!(took >= Duration::from_millis(200), "{took:?}");
+        // reset: a change after the success posts within one step
+        h.aircraft.send_replace(Some("PMDG 777-300ER".into()));
+        until("next", async || posts(&a).await.len() == 7).await;
+    }
+
+    #[test]
+    fn backoff_doubles_from_every_up_to_the_cap() {
+        let (e, max) = (EVERY, BACKOFF_MAX);
+        let mut b = None;
+        let mut steps = Vec::new();
+        for _ in 0..6 {
+            let s = next_backoff(b, e, max);
+            steps.push(s.as_secs());
+            b = Some(s);
+        }
+        assert_eq!(steps, vec![60, 120, 240, 480, 600, 600]);
     }
 
     #[test]

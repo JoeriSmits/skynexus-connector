@@ -339,6 +339,8 @@ impl Engine {
             sim: self.sim_on.subscribe(),
             aircraft: self.aircraft.subscribe(),
             every: presence::EVERY,
+            title_grace: presence::TITLE_GRACE,
+            backoff_max: presence::BACKOFF_MAX,
         };
         let client = TechlogClient::new(url::Url::parse(DEFAULT_BASE).expect("TechLog URL"));
         let task = self.rt.spawn(presence::run(cfg, client, self.api.clone()));

@@ -148,12 +148,24 @@ impl TechlogClient {
     }
 }
 
-/// Whether a ping came from TechLog with its engine up.
+/// Whether a ping came from TechLog with its engine up. The app is checked
+/// first: a ping naming another app is never TechLog, `engine:false` or not.
+/// TechLog's own proxy answers `{"ok":true,"engine":false}` with no `app`
+/// while its engine starts (contract, `Proxy.cs:153-165`), so that exact
+/// shape still counts as starting.
 fn identify(ping: Ping) -> Result<Ping, Code> {
-    if ping.engine == Some(false) {
-        return Err(Code::Starting);
+    let app = ping.app.as_deref();
+    if app.is_some_and(|a| a != "TechLog") {
+        return Err(Code::NotTechlog);
     }
-    if ping.app.as_deref() != Some("TechLog") {
+    if ping.engine == Some(false) {
+        return if ping.ok {
+            Err(Code::Starting)
+        } else {
+            Err(Code::NotTechlog)
+        };
+    }
+    if app != Some("TechLog") {
         return Err(Code::NotTechlog);
     }
     Ok(ping)
@@ -280,6 +292,25 @@ mod tests {
             mock(&s, "/api/ping", ResponseTemplate::new(200).set_body_string(body)).await;
             assert_eq!(client(&s).read().await.0, Code::NotTechlog, "{body}");
         }
+    }
+
+    #[tokio::test]
+    async fn another_app_starting_is_not_techlog() {
+        for body in [
+            r#"{"ok":true,"app":"Other","engine":false}"#,
+            r#"{"ok":false,"engine":false}"#,
+            r#"{"engine":false}"#,
+        ] {
+            let s = MockServer::start().await;
+            let resp = ResponseTemplate::new(200).set_body_string(body);
+            mock(&s, "/api/ping", resp).await;
+            assert_eq!(client(&s).read().await.0, Code::NotTechlog, "{body}");
+            assert_eq!(client(&s).probe().await.0, Code::NotTechlog, "{body}");
+        }
+        let s = MockServer::start().await;
+        let body = r#"{"ok":true,"app":"TechLog","engine":false}"#;
+        mock(&s, "/api/ping", ResponseTemplate::new(200).set_body_string(body)).await;
+        assert_eq!(client(&s).probe().await.0, Code::Starting);
     }
 
     #[tokio::test]

@@ -232,25 +232,24 @@ fn trim(b: &mut GsxBlock) {
     }
 }
 
-/// A gate name exactly as GSX has it, or None. Never cut or trimmed: the
-/// EFB sends the name back and only an exact match is selected.
-fn exact_name(s: &str) -> Option<String> {
-    let ok = !s.trim().is_empty()
-        && s.trim() == s
-        && s.encode_utf16().count() <= MAX_TEXT
-        && !s.chars().any(char::is_control);
-    ok.then(|| s.to_string())
+/// A gate name trimmed (GSX may pad it, Any2GSX trims it too), or None.
+/// Never cut: the EFB sends the name back and only an exact match is
+/// selected (with GSX's untrimmed name, [`super::commands::resolve_gate`]).
+fn gate_name(s: &str) -> Option<String> {
+    let t = s.trim();
+    let ok = !t.is_empty() && t.encode_utf16().count() <= MAX_TEXT && !t.chars().any(char::is_control);
+    ok.then(|| t.to_string())
 }
 
-/// The gate names of GSX's airport, capped to what the EFB accepts. A name
-/// over 24 UTF-16 units is left out, not cut. None when there is no valid
-/// airport or no gate.
+/// The gate names of GSX's airport, trimmed and capped to what the EFB
+/// accepts. A name over 24 UTF-16 units after trimming is left out, not
+/// cut. None when there is no valid airport or no gate.
 pub fn parkings(state: &GsxState) -> Option<GsxParkings> {
     let apt = state.airport().and_then(icao)?;
     let mut names: Vec<String> = state
         .parkings()
         .iter()
-        .filter_map(|n| exact_name(n))
+        .filter_map(|n| gate_name(n))
         .take(PARKINGS_MAX_NAMES)
         .collect();
     let mut p = GsxParkings { apt, names: vec![] };
@@ -589,10 +588,19 @@ mod tests {
             "x".repeat(25),
             plane.repeat(12),
             plane.repeat(13),
-            " D 8".to_string(),
+            " D 8 ".to_string(),
+            format!("  {}  ", "y".repeat(24)),
+            format!(" {} ", "z".repeat(25)),
         ];
         let p = parkings(&state_with(json!([]), names)).unwrap();
-        assert_eq!(p.names, vec!["D 7".to_string(), "x".repeat(24), plane.repeat(12)]);
+        let want = [
+            "D 7".into(),
+            "x".repeat(24),
+            plane.repeat(12),
+            "D 8".into(),
+            "y".repeat(24),
+        ];
+        assert_eq!(p.names, want, "trimmed; over 24 after the trim dropped");
     }
 
     fn frame() -> crate::frame::Frame {

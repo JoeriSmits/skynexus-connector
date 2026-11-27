@@ -93,12 +93,17 @@ pub fn refused(id: String, code: &str) -> CmdResult {
     }
 }
 
-/// `unknown_gate` for a gate that is not exactly one of `names` (the gate
-/// list the block carries, [`super::block::parkings`]); None otherwise.
-pub fn check_gate(id: &str, cmd: &Cmd, names: Option<&[String]>) -> Option<CmdResult> {
-    let Cmd::Gate(gate) = cmd else { return None };
-    let known = names.is_some_and(|n| n.iter().any(|g| g == gate));
-    (!known).then(|| refused(id.to_string(), UNKNOWN_GATE))
+/// A `gsx.gate` must be exactly one of `shown` (the trimmed gate list the
+/// block carries, [`super::block::parkings`]), else `Err(unknown_gate)`.
+/// The gate GSX is asked for is its own, untrimmed name from `raw`
+/// (GSX's parkings as it sent them). Other commands pass through.
+pub fn resolve_gate(id: &str, cmd: Cmd, shown: Option<&[String]>, raw: &[String]) -> Result<Cmd, CmdResult> {
+    let Cmd::Gate(gate) = cmd else { return Ok(cmd) };
+    if !shown.is_some_and(|n| n.contains(&gate)) {
+        return Err(refused(id.to_string(), UNKNOWN_GATE));
+    }
+    let original = raw.iter().find(|r| r.trim() == gate).cloned();
+    Ok(Cmd::Gate(original.unwrap_or(gate)))
 }
 
 /// The GSX verb and args for a command; None for `Read`, which GSX never sees.
@@ -201,13 +206,24 @@ mod tests {
     fn only_a_gate_on_the_list_is_selected() {
         let names = ["D 7".to_string(), "D 8".to_string()];
         let gate = |g: &str| Cmd::Gate(g.into());
-        assert_eq!(check_gate("c1", &gate("D 8"), Some(&names)), None);
-        let unknown = Some(refused("c1".into(), UNKNOWN_GATE));
+        let ok = resolve_gate("c1", gate("D 8"), Some(&names), &names);
+        assert_eq!(ok, Ok(gate("D 8")));
+        let unknown = Err(refused("c1".into(), UNKNOWN_GATE));
         for g in ["d 8", "D8", "D 8 ", "Gate 14"] {
-            assert_eq!(check_gate("c1", &gate(g), Some(&names)), unknown, "{g}");
+            assert_eq!(resolve_gate("c1", gate(g), Some(&names), &names), unknown, "{g}");
         }
-        assert_eq!(check_gate("c1", &gate("D 8"), None), unknown, "no list yet");
-        assert_eq!(check_gate("c1", &Cmd::Simbrief, None), None);
+        assert_eq!(resolve_gate("c1", gate("D 8"), None, &[]), unknown, "no list yet");
+        assert_eq!(resolve_gate("c1", Cmd::Simbrief, None, &[]), Ok(Cmd::Simbrief));
+    }
+
+    #[test]
+    fn a_padded_gsx_name_is_matched_trimmed_and_sent_as_gsx_has_it() {
+        let shown = ["D 7".to_string(), "D 8".to_string()];
+        let raw = [" D 7 ".to_string(), "D 8".to_string()];
+        let got = resolve_gate("c1", Cmd::Gate("D 7".into()), Some(&shown), &raw);
+        assert_eq!(got, Ok(Cmd::Gate(" D 7 ".into())));
+        let got = resolve_gate("c1", Cmd::Gate("D 8".into()), Some(&shown), &raw);
+        assert_eq!(got, Ok(Cmd::Gate("D 8".into())));
     }
 
     /// A GSX that answers the first command it gets with `answer` (or never).

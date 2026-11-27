@@ -44,7 +44,7 @@ use tokio::time::{sleep_until, Instant};
 
 use super::block::{block, parkings, CmdResult, Emitter, GsxBlock, GsxParkings};
 use super::client::GsxClient;
-use super::commands::{check_gate, execute, parse_cmd, refused, Cmd, BUSY, NOT_READING};
+use super::commands::{execute, parse_cmd, refused, resolve_gate, Cmd, BUSY, NOT_READING};
 use super::detect::{classify, GsxCode, Hello};
 use super::state::GsxState;
 use crate::api::{ApiClient, ApiError};
@@ -276,13 +276,22 @@ async fn read_loop(
                 None => break,
                 Some(ToReader::Show(r)) => last = Some(r),
                 Some(ToReader::Run(id, cmd, at)) => {
-                    // Only a gate on GSX's own list for its airport is selected.
+                    // Only a gate on GSX's own list for its airport is selected,
+                    // by the name as GSX has it.
                     let gates = parkings(&state).map(|p| p.names);
-                    if at.elapsed() > MAX_CMD_AGE {
+                    let cmd = if at.elapsed() > MAX_CMD_AGE {
                         log::info!("gsx: {} dropped; it waited {} s", cmd.verb(), at.elapsed().as_secs());
-                    } else if let Some(r) = check_gate(&id, &cmd, gates.as_deref()) {
-                        last = Some(r);
+                        None
                     } else {
+                        match resolve_gate(&id, cmd, gates.as_deref(), &state.parkings()) {
+                            Ok(cmd) => Some(cmd),
+                            Err(r) => {
+                                last = Some(r);
+                                None
+                            }
+                        }
+                    };
+                    if let Some(cmd) = cmd {
                         let run = execute(&mut client, id, cmd);
                         tokio::pin!(run);
                         let done = loop {
@@ -1451,6 +1460,23 @@ mod tests {
         h.cmd("c2", "gsx.simbrief", json!({})).await;
         h.last_is("c2", true, None).await;
         assert_eq!(sent(&g)[1]["args"]["command"], "RELOAD_SIMBRIEF");
+    }
+
+    #[tokio::test]
+    async fn a_padded_gate_is_shown_trimmed_and_selected_as_gsx_has_it() {
+        let snap = json!({"type":"snapshot","state":3,
+            "handlerData":{
+                "airport":{"icao":"EHAM","parkings":[{"uiGateName":" D 7 "},{"uiGateName":"D 8"}]},
+                "gate":{"uiName":"","uiGateName":"D 8","uiType":"GATE_MEDIUM"}}});
+        let script = vec![(vec![HELLO.into(), snap.to_string()], false)];
+        let g = fake_gsx_answering(script, Some((Duration::ZERO, true))).await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let mut h = start(&a, opts(g.port));
+        let feed = h.out.wait_for(Option::is_some).await.unwrap().clone().unwrap();
+        assert_eq!(feed.parkings.unwrap().names, vec!["D 7", "D 8"]);
+        h.cmd("c1", "gsx.gate", json!({"gate":"D 7"})).await;
+        h.last_is("c1", true, None).await;
+        assert_eq!(sent(&g)[0]["args"]["gate"], " D 7 ");
     }
 
     #[tokio::test]

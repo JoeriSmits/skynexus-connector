@@ -21,7 +21,7 @@ pub struct TicketManager {
     /// up the server switches on each renewal.
     features: Option<watch::Sender<Features>>,
     /// Gets `(features.gsx, features.gsxRead)` of every ticket fetched.
-    gsx_features: Option<watch::Sender<(bool, bool)>>,
+    gsx_features: Option<watch::Sender<Option<(bool, bool)>>>,
 }
 
 fn refresh_at(t: &Ticket) -> Instant {
@@ -48,7 +48,7 @@ impl TicketManager {
 
     /// Publishes `(gsx, gsxRead)` of every fetched ticket on `tx`, even when
     /// unchanged (the GSX runner waits for the next ticket after a 503).
-    pub fn with_gsx_features(mut self, tx: watch::Sender<(bool, bool)>) -> Self {
+    pub fn with_gsx_features(mut self, tx: watch::Sender<Option<(bool, bool)>>) -> Self {
         self.gsx_features = Some(tx);
         self
     }
@@ -72,7 +72,7 @@ impl TicketManager {
             f.send_replace(t.features);
         }
         if let Some(g) = &self.gsx_features {
-            g.send_replace((t.gsx, t.gsx_read));
+            g.send_replace(Some((t.gsx, t.gsx_read)));
         }
         self.current = Some(t.clone());
         Ok(t)
@@ -216,13 +216,13 @@ mod tests {
         let features = serde_json::json!({ "gsx": true, "gsxRead": false });
         let body = serde_json::json!({ "ticket": "o", "expires_in": 900, "features": features });
         let s = server(body).await;
-        let (tx, mut rx) = watch::channel((true, true));
+        let (tx, mut rx) = watch::channel(None);
         let api = ApiClient::new(&s.uri());
         let mut m = TicketManager::new(api, "cred-1".into()).with_gsx_features(tx);
         let t0 = Instant::now();
         m.valid(t0).await.unwrap();
         assert!(rx.has_changed().unwrap());
-        assert_eq!(*rx.borrow_and_update(), (true, false));
+        assert_eq!(*rx.borrow_and_update(), Some((true, false)));
         m.invalidate();
         m.valid(t0).await.unwrap();
         assert!(rx.has_changed().unwrap(), "a renewal is published");

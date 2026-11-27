@@ -147,9 +147,9 @@ pub struct Engine {
     sim_extras: watch::Sender<sim::SimExtras>,
     /// The connected sim while a flight is loaded; None otherwise.
     sim_kind: watch::Sender<Option<SimKind>>,
-    /// `(features.gsx, features.gsxRead)` of every ticket; both true until a
-    /// ticket says otherwise.
-    gsx_features: watch::Sender<(bool, bool)>,
+    /// `(features.gsx, features.gsxRead)` of every ticket; None until the
+    /// first ticket, so GSX is neither read nor posted before one.
+    gsx_features: watch::Sender<Option<(bool, bool)>>,
     /// The "Read GSX" switch; on unless the tray turned it off.
     read_gsx: watch::Sender<bool>,
     /// What the GSX runner reads, for the own-ship frames.
@@ -190,7 +190,7 @@ impl Engine {
             aircraft: watch::channel(None).0,
             sim_extras: watch::channel(sim::SimExtras::default()).0,
             sim_kind: watch::channel(None).0,
-            gsx_features: watch::channel((true, true)).0,
+            gsx_features: watch::channel(None).0,
             read_gsx: watch::channel(true).0,
             gsx: watch::channel(None).0,
         })
@@ -231,12 +231,13 @@ impl Engine {
     }
 
     /// The credential for the TechLog and GSX runners. Signing out also
-    /// forgets the last ticket's `features` (`techlog` and `techlogRead`;
-    /// `gsx` and `gsxRead` go back to on), so another account waits for its own.
+    /// forgets the last ticket's `features` (`techlog` and `techlogRead`
+    /// back to off, `gsx` and `gsxRead` to no ticket yet), so another
+    /// account waits for its own.
     fn set_credential(&self, c: Option<&Credential>) {
         if c.is_none() {
             self.techlog_features.send_replace(Features::default());
-            self.gsx_features.send_replace((true, true));
+            self.gsx_features.send_replace(None);
         }
         self.credential_tx.send_replace(c.map(|c| c.credential.clone()));
     }
@@ -805,13 +806,13 @@ mod tests {
             techlog_read: true,
         };
         engine.techlog_features.send_replace(both);
-        engine.gsx_features.send_replace((false, false));
+        engine.gsx_features.send_replace(Some((false, false)));
         engine.sign_out();
         assert!(
             *engine.techlog_features.borrow() == Features::default(),
             "a new account waits for its own ticket"
         );
-        assert_eq!(*engine.gsx_features.borrow(), (true, true), "GSX back to its default");
+        assert_eq!(*engine.gsx_features.borrow(), None, "GSX waits for a ticket");
         assert_eq!(*engine.credential_tx.borrow(), None);
         let started = std::time::Instant::now();
         engine.shutdown();
@@ -871,6 +872,7 @@ mod tests {
         let mut gsx = engine.gsx.subscribe();
         let secs = std::time::Duration::from_secs;
         engine.credential_tx.send_replace(Some("snc_1".into()));
+        engine.gsx_features.send_replace(Some((true, true)));
         engine.sim_kind.send_replace(Some(SimKind::Msfs));
         rt.block_on(async {
             let up = tokio::time::timeout(secs(5), gsx.wait_for(Option::is_some));

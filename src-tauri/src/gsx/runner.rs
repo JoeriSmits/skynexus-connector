@@ -10,10 +10,14 @@
 //!   credential, so a restart without a change posts nothing. A GSX that is
 //!   not up yet in the first [`GsxTiming::settle`] after MSFS connected is
 //!   not posted: Couatl starts some seconds after the flight loads.
+//! - Nothing is read or posted before the first ticket (or after sign-out
+//!   until the next one).
 //! - Reads while `features.gsx && features.gsxRead && tray`, signed in and
 //!   in MSFS. The read loop runs in its own task with a fresh [`GsxState`]
-//!   per connection, aborted when any of that stops; the current block and
-//!   gate list go on `out` for the frame builder ([`frame_json`]).
+//!   per connection, stopped (and awaited) when any of that stops; the
+//!   current block and gate list go on `out` for the frame builder
+//!   ([`frame_json`]). A socket that drops is redialled after 2 s, doubling
+//!   to 30 s while sessions keep dropping, back to 2 s after one of 60 s.
 //! - A 503 `disabled` stops posting until the next ticket; a 401 until the
 //!   credential changes; a 400 is not resent for the same health.
 
@@ -74,8 +78,12 @@ pub struct GsxTiming {
     /// After MSFS connected, `GSX_NOT_RUNNING` and `GSX_NO_API` wait this
     /// long before they are posted.
     pub settle: Duration,
-    /// After the GSX socket dropped, before the next detection.
+    /// After the GSX socket dropped, before the next detection; doubles
+    /// on every drop up to `reconnect_max`.
     pub reconnect_after: Duration,
+    pub reconnect_max: Duration,
+    /// A session that lasted this long resets the reconnect wait.
+    pub stable_after: Duration,
 }
 
 impl Default for GsxTiming {
@@ -84,6 +92,8 @@ impl Default for GsxTiming {
             detect_every: Duration::from_secs(30),
             settle: Duration::from_secs(90),
             reconnect_after: Duration::from_secs(2),
+            reconnect_max: Duration::from_secs(30),
+            stable_after: Duration::from_secs(60),
         }
     }
 }
@@ -91,8 +101,9 @@ impl Default for GsxTiming {
 pub struct GsxRunnerCfg {
     /// The connector credential; None while signed out.
     pub credential: watch::Receiver<Option<String>>,
-    /// `(features.gsx, features.gsxRead)` of every ticket.
-    pub features: watch::Receiver<(bool, bool)>,
+    /// `(features.gsx, features.gsxRead)` of every ticket; None until the
+    /// first ticket (and again after sign-out).
+    pub features: watch::Receiver<Option<(bool, bool)>>,
     /// The tray's "Read GSX".
     pub tray: watch::Receiver<bool>,
     /// The connected sim with a flight loaded; None otherwise.
@@ -148,12 +159,31 @@ fn publish(out: &watch::Sender<Option<GsxFeed>>, v: Option<GsxFeed>) {
 struct Reader {
     task: JoinHandle<()>,
     version: Option<String>,
+    started: Instant,
 }
 
 impl Drop for Reader {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+/// Stops the read loop and waits until it is gone, so a block it was
+/// publishing cannot land after the `None` that follows.
+async fn stop(reader: &mut Option<Reader>) {
+    if let Some(mut r) = reader.take() {
+        // A finished task may have been awaited already (`ended`).
+        if !r.task.is_finished() {
+            r.task.abort();
+            let _ = (&mut r.task).await;
+        }
+    }
+}
+
+/// Stops reading and clears the feed.
+async fn stop_reading(reader: &mut Option<Reader>, out: &watch::Sender<Option<GsxFeed>>) {
+    stop(reader).await;
+    publish(out, None);
 }
 
 /// Resolves when the read loop ended by itself (the socket dropped).
@@ -225,6 +255,30 @@ async fn probe(p: &GsxProbe, couatl: Option<bool>) -> (GsxCode, Option<String>, 
     }
 }
 
+/// The wait before redialling a GSX whose socket dropped.
+struct Redial {
+    base: Duration,
+    max: Duration,
+    next: Duration,
+}
+
+impl Redial {
+    fn new(base: Duration, max: Duration) -> Self {
+        Redial { base, max, next: base }
+    }
+
+    /// The wait after a session that ran for `ran`: doubles every time, up
+    /// to the cap, and starts over after a session of at least `stable`.
+    fn after(&mut self, ran: Duration, stable: Duration) -> Duration {
+        if ran >= stable {
+            self.next = self.base;
+        }
+        let d = self.next;
+        self.next = (d * 2).min(self.max);
+        d
+    }
+}
+
 enum Wake {
     Closed,
     Ticket,
@@ -248,17 +302,26 @@ pub async fn run(mut cfg: GsxRunnerCfg, api: ApiClient, out: watch::Sender<Optio
     let mut post_failing = false;
     let mut msfs_since: Option<Instant> = None;
     let mut last_logged: Option<GsxPosted> = None;
+    let mut redial = Redial::new(t.reconnect_after, t.reconnect_max);
     loop {
         let credential = cfg.credential.borrow_and_update().clone();
-        let (gsx, gsx_read) = *cfg.features.borrow_and_update();
+        let features = *cfg.features.borrow_and_update();
         let tray = *cfg.tray.borrow_and_update();
         let msfs = *cfg.sim.borrow_and_update() == Some(SimKind::Msfs);
-        let active = credential.clone().filter(|_| msfs);
-        if let Some(credential) = &active {
-            let since = *msfs_since.get_or_insert_with(Instant::now);
+        let signed_in_msfs = credential.clone().filter(|_| msfs);
+        // The settle window starts when MSFS connects, not at the ticket.
+        let since = signed_in_msfs
+            .as_ref()
+            .map(|_| *msfs_since.get_or_insert_with(Instant::now));
+        if since.is_none() {
+            msfs_since = None;
+        }
+        // Nothing is read or posted before the first ticket says what is on.
+        let active = signed_in_msfs.zip(features);
+        if let (Some((credential, (gsx, gsx_read))), Some(since)) = (&active, since) {
+            let (gsx, gsx_read) = (*gsx, *gsx_read);
             if !(gsx && gsx_read && tray) {
-                reader = None;
-                publish(&out, None);
+                stop_reading(&mut reader, &out).await;
             }
             let (code, version) = match &reader {
                 Some(r) => (GsxCode::Ok, r.version.clone()),
@@ -270,6 +333,7 @@ pub async fn run(mut cfg: GsxRunnerCfg, api: ApiClient, out: watch::Sender<Optio
                         reader = Some(Reader {
                             task,
                             version: version.clone(),
+                            started: Instant::now(),
                         });
                     }
                     (code, version)
@@ -335,9 +399,7 @@ pub async fn run(mut cfg: GsxRunnerCfg, api: ApiClient, out: watch::Sender<Optio
                 }
             }
         } else {
-            reader = None;
-            msfs_since = None;
-            publish(&out, None);
+            stop_reading(&mut reader, &out).await;
         }
         let wake = tokio::select! {
             _ = sleep(t.detect_every), if active.is_some() => Wake::Other,
@@ -349,15 +411,15 @@ pub async fn run(mut cfg: GsxRunnerCfg, api: ApiClient, out: watch::Sender<Optio
         };
         match wake {
             Wake::Closed => {
-                drop(reader);
-                publish(&out, None);
+                stop_reading(&mut reader, &out).await;
                 return;
             }
             Wake::Ticket => server_off = false,
             Wake::ReaderEnded => {
-                reader = None;
-                publish(&out, None);
-                sleep(t.reconnect_after).await;
+                let ran = reader.as_ref().map_or(Duration::ZERO, |r| r.started.elapsed());
+                stop_reading(&mut reader, &out).await;
+                // A GSX that accepts and drops at once is not dialled every 2 s.
+                sleep(redial.after(ran, t.stable_after)).await;
             }
             Wake::Other => {}
         }
@@ -441,7 +503,9 @@ mod tests {
                 tokio::spawn(async move {
                     let mut ws = tokio_tungstenite::accept_async(s).await.unwrap();
                     for m in msgs {
-                        ws.send(Message::text(m)).await.unwrap();
+                        if ws.send(Message::text(m)).await.is_err() {
+                            break;
+                        }
                     }
                     if !close {
                         while let Some(Ok(_)) = ws.next().await {}
@@ -482,6 +546,8 @@ mod tests {
             detect_every: Duration::from_millis(30),
             settle: Duration::ZERO,
             reconnect_after: Duration::from_millis(10),
+            reconnect_max: Duration::from_millis(40),
+            stable_after: Duration::from_secs(60),
         }
     }
 
@@ -489,7 +555,7 @@ mod tests {
         installed: bool,
         port: u16,
         sim: SimKind,
-        features: (bool, bool),
+        features: Option<(bool, bool)>,
         file: Option<PathBuf>,
         timing: GsxTiming,
     }
@@ -499,7 +565,7 @@ mod tests {
             installed: true,
             port,
             sim: SimKind::Msfs,
-            features: (true, true),
+            features: Some((true, true)),
             file: None,
             timing: fast(),
         }
@@ -508,7 +574,7 @@ mod tests {
     struct H {
         out: watch::Receiver<Option<GsxFeed>>,
         credential: watch::Sender<Option<String>>,
-        features: watch::Sender<(bool, bool)>,
+        features: watch::Sender<Option<(bool, bool)>>,
         tray: watch::Sender<bool>,
         sim: watch::Sender<Option<SimKind>>,
         _extras: watch::Sender<SimExtras>,
@@ -676,7 +742,7 @@ mod tests {
         let h = start(
             &a,
             Opts {
-                features: (true, false),
+                features: Some((true, false)),
                 ..opts(g.port)
             },
         );
@@ -702,7 +768,7 @@ mod tests {
         until("the socket closed", async || g.closed.load(Ordering::SeqCst) >= 1).await;
         h.tray.send_replace(true);
         h.out.wait_for(Option::is_some).await.unwrap();
-        h.features.send_replace((false, true));
+        h.features.send_replace(Some((false, true)));
         h.out.wait_for(Option::is_none).await.unwrap();
     }
 
@@ -756,6 +822,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_settle_window_elapses_then_not_running_posts() {
+        let a = app(ResponseTemplate::new(204)).await;
+        let timing = GsxTiming {
+            settle: Duration::from_millis(300),
+            ..fast()
+        };
+        let o = Opts {
+            timing,
+            ..opts(refused_port())
+        };
+        let t0 = std::time::Instant::now();
+        let _h = start(&a, o);
+        n_posts(&a, 1).await;
+        assert!(t0.elapsed() >= Duration::from_millis(300), "not inside the window");
+        assert_eq!(health(&posts(&a).await[0])["code"], "GSX_NOT_RUNNING");
+    }
+
+    #[tokio::test]
+    async fn gsx_ok_posts_at_once_inside_the_settle_window() {
+        let g = gsx_up().await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let timing = GsxTiming {
+            settle: Duration::from_secs(30),
+            ..fast()
+        };
+        let o = Opts { timing, ..opts(g.port) };
+        let _h = start(&a, o);
+        n_posts(&a, 1).await;
+        assert_eq!(health(&posts(&a).await[0])["code"], "GSX_OK");
+    }
+
+    #[tokio::test]
+    async fn nothing_is_read_or_posted_before_the_first_ticket() {
+        let g = gsx_up().await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let o = Opts {
+            features: None,
+            ..opts(g.port)
+        };
+        let mut h = start(&a, o);
+        quiet().await;
+        assert!(posts(&a).await.is_empty(), "no post before a ticket");
+        assert_eq!(g.accepts.load(Ordering::SeqCst), 0, "no read");
+        assert_eq!(*h.out.borrow(), None);
+        h.features.send_replace(Some((true, true)));
+        h.out.wait_for(Option::is_some).await.unwrap();
+        n_posts(&a, 1).await;
+        quiet().await;
+        assert_eq!(posts(&a).await.len(), 1, "then once");
+        // Signed out (or a new account): back to waiting.
+        h.features.send_replace(None);
+        h.out.wait_for(Option::is_none).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_block_never_lands_after_the_none() {
+        // A GSX that patches without pause: the read loop publishes all the time.
+        let patches = (0..4000).map(|n| {
+            let gate = format!("D {}", n % 50);
+            let p = json!({"type":"patch","path":"/handlerData/gate/uiGateName","value":gate});
+            p.to_string()
+        });
+        let msgs = [HELLO.to_string(), snapshot("D 7")].into_iter().chain(patches);
+        let g = fake_gsx(vec![(msgs.collect(), false)]).await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let mut h = start(&a, opts(g.port));
+        for _ in 0..10 {
+            h.out.wait_for(Option::is_some).await.unwrap();
+            h.tray.send_replace(false);
+            h.out.wait_for(Option::is_none).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(*h.out.borrow(), None, "a block landed after the None");
+            h.tray.send_replace(true);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gsx_that_drops_at_once_is_redialled_ever_slower() {
+        let g = fake_gsx(vec![(vec![HELLO.into(), snapshot("D 7")], true)]).await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let timing = GsxTiming {
+            reconnect_after: Duration::from_millis(40),
+            reconnect_max: Duration::from_millis(320),
+            ..fast()
+        };
+        let _h = start(&a, Opts { timing, ..opts(g.port) });
+        // Waits 40, 80, 160, 320: five dials in 600 ms, not fifteen.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let n = g.accepts.load(Ordering::SeqCst);
+        assert!((3..=6).contains(&n), "{n} dials");
+    }
+
+    #[test]
+    fn the_redial_wait_doubles_to_its_cap_and_resets_after_a_long_session() {
+        let ms = Duration::from_millis;
+        let mut r = Redial::new(ms(2), ms(30));
+        let short = ms(1);
+        let stable = ms(60);
+        let waits: Vec<_> = (0..6).map(|_| r.after(short, stable)).collect();
+        assert_eq!(waits, [ms(2), ms(4), ms(8), ms(16), ms(30), ms(30)]);
+        assert_eq!(r.after(stable, stable), ms(2), "a long session resets it");
+        assert_eq!(r.after(short, stable), ms(4));
+    }
+
+    #[tokio::test]
     async fn disabled_stops_posting_until_the_next_ticket() {
         let a = MockServer::start().await;
         let off = json!({ "error": "disabled" });
@@ -780,7 +951,7 @@ mod tests {
         n_posts(&a, 1).await;
         quiet().await;
         assert_eq!(posts(&a).await.len(), 1, "no retries while switched off");
-        h.features.send_replace((true, true));
+        h.features.send_replace(Some((true, true)));
         n_posts(&a, 2).await;
         quiet().await;
         assert_eq!(posts(&a).await.len(), 2, "accepted, then quiet");

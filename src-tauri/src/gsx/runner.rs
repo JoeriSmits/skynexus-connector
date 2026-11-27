@@ -20,18 +20,24 @@
 //!   to 30 s while sessions keep dropping, back to 2 s after one of 60 s.
 //! - A 503 `disabled` stops posting until the next ticket; a 401 until the
 //!   credential changes; a 400 is not resent for the same health.
+//! - The relay's `cmd` messages ([`super::commands`]): `gsx.read` sets the
+//!   read switch until the next ticket; `gsx.gate` and `gsx.simbrief` run
+//!   in the read loop, one at a time, and their result rides on the blocks
+//!   as `last`. A gate GSX does not list is `unknown_gate`; nothing runs
+//!   while GSX is not read.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, Instant};
+use tokio::time::{sleep, sleep_until, Instant};
 
-use super::block::{block, parkings, Emitter, GsxBlock, GsxParkings};
+use super::block::{block, parkings, CmdResult, Emitter, GsxBlock, GsxParkings};
 use super::client::GsxClient;
+use super::commands::{check_gate, execute, parse_cmd, refused, Cmd, BUSY, NOT_READING};
 use super::detect::{classify, GsxCode, Hello};
 use super::state::GsxState;
 use crate::api::{ApiClient, ApiError};
@@ -45,6 +51,8 @@ pub const HEALTH_SCHEMA: u8 = 1;
 const MAX_VERSION: usize = 24;
 /// The longest `Retry-After` honoured from the GSX route.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
+/// Commands queued for the read loop; it drains them even while busy.
+const READER_QUEUE: usize = 4;
 
 /// What the frame builder puts on the next frames: the block and GSX's
 /// gate list for its airport.
@@ -114,6 +122,8 @@ pub struct GsxRunnerCfg {
     /// Where the last posted health is kept; None keeps it in memory only.
     pub posted_file: Option<PathBuf>,
     pub timing: GsxTiming,
+    /// The relay's `cmd` messages, unparsed.
+    pub cmds: mpsc::Receiver<Value>,
 }
 
 fn code_str(c: GsxCode) -> &'static str {
@@ -155,11 +165,20 @@ fn publish(out: &watch::Sender<Option<GsxFeed>>, v: Option<GsxFeed>) {
     });
 }
 
+/// What the runner hands the read loop.
+enum ToReader {
+    /// Run this on GSX.
+    Run(String, Cmd),
+    /// Put this result on the blocks (a `gsx.read` the runner handled).
+    Show(CmdResult),
+}
+
 /// The read loop's task; dropping it aborts the loop (and closes the socket).
 struct Reader {
     task: JoinHandle<()>,
     version: Option<String>,
     started: Instant,
+    cmds: mpsc::Sender<ToReader>,
 }
 
 impl Drop for Reader {
@@ -196,20 +215,31 @@ async fn ended(reader: &mut Option<Reader>) {
     }
 }
 
+fn feed(state: &GsxState, extras: &SimExtras, last: &Option<CmdResult>) -> GsxFeed {
+    GsxFeed {
+        block: block(state, extras, last.clone()),
+        parkings: parkings(state),
+    }
+}
+
 /// Reads one GSX session into a fresh state and publishes the feed after
-/// every message (and every L:var change, for the pax fallback). Clears the
-/// feed when the socket closes.
+/// every message (and every L:var change, for the pax fallback). Runs the
+/// runner's commands one at a time; one that comes while another waits for
+/// GSX is `busy`. The latest result rides on every block as `last`. Clears
+/// the feed when the socket closes.
 async fn read_loop(
     mut client: GsxClient,
     hello: Value,
     mut extras: watch::Receiver<SimExtras>,
     out: watch::Sender<Option<GsxFeed>>,
+    mut cmds: mpsc::Receiver<ToReader>,
 ) {
     // `connect` consumed the hello: seed the new session's state with it.
     let mut state = GsxState::default();
     state.apply(&hello);
     let mut has_state = false;
-    loop {
+    let mut last: Option<CmdResult> = None;
+    'session: loop {
         tokio::select! {
             msg = client.next() => {
                 let Some(msg) = msg else { break };
@@ -218,16 +248,76 @@ async fn read_loop(
                 state.apply(&msg);
             }
             r = extras.changed() => if r.is_err() { break },
+            c = cmds.recv() => match c {
+                // The runner let go of this session.
+                None => break,
+                Some(ToReader::Show(r)) => last = Some(r),
+                Some(ToReader::Run(id, cmd)) => {
+                    // Only a gate on GSX's own list for its airport is selected.
+                    let gates = parkings(&state).map(|p| p.names);
+                    if let Some(r) = check_gate(&id, &cmd, gates.as_deref()) {
+                        last = Some(r);
+                    } else {
+                        let run = execute(&mut client, id, cmd);
+                        tokio::pin!(run);
+                        let done = loop {
+                            tokio::select! {
+                                r = &mut run => break r,
+                                c = cmds.recv() => {
+                                    match c {
+                                        None => break 'session,
+                                        Some(ToReader::Run(id, _)) => last = Some(refused(id, BUSY)),
+                                        Some(ToReader::Show(r)) => last = Some(r),
+                                    }
+                                    if has_state {
+                                        publish(&out, Some(feed(&state, &extras.borrow(), &last)));
+                                    }
+                                }
+                            }
+                        };
+                        last = Some(done);
+                    }
+                }
+            },
         }
         if has_state {
-            let feed = GsxFeed {
-                block: block(&state, &extras.borrow(), None),
-                parkings: parkings(&state),
-            };
-            publish(&out, Some(feed));
+            publish(&out, Some(feed(&state, &extras.borrow(), &last)));
         }
     }
     publish(&out, None);
+}
+
+/// One relay `cmd`. A `gsx.read` sets the read switch until the next
+/// ticket and returns true (the runner looks again at once). The others go
+/// to the read loop; without one they are not run (`not_reading`, which
+/// no block carries, so it is only logged).
+fn on_cmd(
+    v: &Value,
+    reader: &Option<Reader>,
+    read_override: &mut Option<bool>,
+    pending: &mut Option<CmdResult>,
+) -> bool {
+    let Some((id, cmd)) = parse_cmd(v) else {
+        log::debug!("gsx: ignoring a command the Connector does not run");
+        return false;
+    };
+    let verb = cmd.verb();
+    if let Cmd::Read(on) = cmd {
+        log::info!("gsx: reading switched {} from SkyNexus", if on { "on" } else { "off" });
+        *read_override = Some(on);
+        *pending = Some(CmdResult {
+            id,
+            ok: true,
+            code: None,
+        });
+        return true;
+    }
+    match reader.as_ref().map(|r| r.cmds.try_send(ToReader::Run(id, cmd))) {
+        Some(Ok(())) => {}
+        Some(Err(_)) => log::info!("gsx: {verb} dropped; the read loop is not taking commands"),
+        None => log::info!("gsx: {verb} not run ({NOT_READING})"),
+    }
+    false
 }
 
 /// One detection. With a readable GSX, also the open client and its hello,
@@ -303,6 +393,11 @@ pub async fn run(mut cfg: GsxRunnerCfg, api: ApiClient, out: watch::Sender<Optio
     let mut msfs_since: Option<Instant> = None;
     let mut last_logged: Option<GsxPosted> = None;
     let mut redial = Redial::new(t.reconnect_after, t.reconnect_max);
+    // `gsx.read` from SkyNexus; the next ticket clears it.
+    let mut read_override: Option<bool> = None;
+    // The `gsx.read` result, for the next block when GSX is read after it.
+    let mut pending: Option<CmdResult> = None;
+    let mut cmds_open = true;
     loop {
         let credential = cfg.credential.borrow_and_update().clone();
         let features = *cfg.features.borrow_and_update();
@@ -319,7 +414,7 @@ pub async fn run(mut cfg: GsxRunnerCfg, api: ApiClient, out: watch::Sender<Optio
         // Nothing is read or posted before the first ticket says what is on.
         let active = signed_in_msfs.zip(features);
         if let (Some((credential, (gsx, gsx_read))), Some(since)) = (&active, since) {
-            let (gsx, gsx_read) = (*gsx, *gsx_read);
+            let (gsx, gsx_read) = (*gsx, read_override.unwrap_or(*gsx_read));
             if !(gsx && gsx_read && tray) {
                 stop_reading(&mut reader, &out).await;
             }
@@ -329,11 +424,14 @@ pub async fn run(mut cfg: GsxRunnerCfg, api: ApiClient, out: watch::Sender<Optio
                     let couatl = cfg.extras.borrow().couatl_started;
                     let (code, version, client) = probe(&cfg.probe, couatl).await;
                     if let Some((client, hello)) = client.filter(|_| gsx && gsx_read && tray) {
-                        let task = tokio::spawn(read_loop(client, hello, cfg.extras.clone(), out.clone()));
+                        let (tx, rx) = mpsc::channel(READER_QUEUE);
+                        let extras = cfg.extras.clone();
+                        let task = tokio::spawn(read_loop(client, hello, extras, out.clone(), rx));
                         reader = Some(Reader {
                             task,
                             version: version.clone(),
                             started: Instant::now(),
+                            cmds: tx,
                         });
                     }
                     (code, version)
@@ -401,20 +499,34 @@ pub async fn run(mut cfg: GsxRunnerCfg, api: ApiClient, out: watch::Sender<Optio
         } else {
             stop_reading(&mut reader, &out).await;
         }
-        let wake = tokio::select! {
-            _ = sleep(t.detect_every), if active.is_some() => Wake::Other,
-            _ = ended(&mut reader) => Wake::ReaderEnded,
-            r = cfg.features.changed() => if r.is_err() { Wake::Closed } else { Wake::Ticket },
-            r = cfg.credential.changed() => if r.is_err() { Wake::Closed } else { Wake::Other },
-            r = cfg.tray.changed() => if r.is_err() { Wake::Closed } else { Wake::Other },
-            r = cfg.sim.changed() => if r.is_err() { Wake::Closed } else { Wake::Other },
+        if let (Some(r), Some(rd)) = (pending.take(), &reader) {
+            let _ = rd.cmds.try_send(ToReader::Show(r));
+        }
+        let next_detect = Instant::now() + t.detect_every;
+        let wake = loop {
+            tokio::select! {
+                _ = sleep_until(next_detect), if active.is_some() => break Wake::Other,
+                _ = ended(&mut reader) => break Wake::ReaderEnded,
+                r = cfg.features.changed() => break if r.is_err() { Wake::Closed } else { Wake::Ticket },
+                r = cfg.credential.changed() => break if r.is_err() { Wake::Closed } else { Wake::Other },
+                r = cfg.tray.changed() => break if r.is_err() { Wake::Closed } else { Wake::Other },
+                r = cfg.sim.changed() => break if r.is_err() { Wake::Closed } else { Wake::Other },
+                c = cfg.cmds.recv(), if cmds_open => match c {
+                    None => cmds_open = false,
+                    Some(v) => if on_cmd(&v, &reader, &mut read_override, &mut pending) { break Wake::Other },
+                },
+            }
         };
         match wake {
             Wake::Closed => {
                 stop_reading(&mut reader, &out).await;
                 return;
             }
-            Wake::Ticket => server_off = false,
+            Wake::Ticket => {
+                server_off = false;
+                // The ticket says again whether GSX is read.
+                read_override = None;
+            }
             Wake::ReaderEnded => {
                 let ran = reader.as_ref().map_or(Duration::ZERO, |r| r.started.elapsed());
                 stop_reading(&mut reader, &out).await;
@@ -453,9 +565,11 @@ pub fn frame_json(
 
 #[cfg(test)]
 mod tests {
+    use super::super::block::GsxLast;
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::Message;
     use wiremock::matchers::{method, path};
@@ -480,8 +594,13 @@ mod tests {
         port: u16,
         accepts: Arc<AtomicUsize>,
         closed: Arc<AtomicUsize>,
+        /// Commands it got, other than `state.get`.
+        got: Arc<Mutex<Vec<Value>>>,
         task: JoinHandle<()>,
     }
+
+    /// How a fake GSX answers a command: after a wait, with `ok`.
+    type Answer = Option<(Duration, bool)>;
 
     impl Drop for FakeGsx {
         fn drop(&mut self) {
@@ -490,16 +609,21 @@ mod tests {
     }
 
     async fn fake_gsx(scripts: Vec<(Vec<String>, bool)>) -> FakeGsx {
+        fake_gsx_answering(scripts, None).await
+    }
+
+    async fn fake_gsx_answering(scripts: Vec<(Vec<String>, bool)>, answer: Answer) -> FakeGsx {
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
         let (accepts, closed) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let (a, c) = (accepts.clone(), closed.clone());
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let (a, c, g) = (accepts.clone(), closed.clone(), got.clone());
         let task = tokio::spawn(async move {
             loop {
                 let (s, _) = l.accept().await.unwrap();
                 let n = a.fetch_add(1, Ordering::SeqCst);
                 let (msgs, close) = scripts[n.min(scripts.len() - 1)].clone();
-                let c = c.clone();
+                let (c, g) = (c.clone(), g.clone());
                 tokio::spawn(async move {
                     let mut ws = tokio_tungstenite::accept_async(s).await.unwrap();
                     for m in msgs {
@@ -507,8 +631,22 @@ mod tests {
                             break;
                         }
                     }
-                    if !close {
-                        while let Some(Ok(_)) = ws.next().await {}
+                    if close {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        return;
+                    }
+                    while let Some(Ok(m)) = ws.next().await {
+                        let Message::Text(t) = m else { continue };
+                        let v: Value = serde_json::from_str(&t).unwrap();
+                        if v["type"] != "command" || v["verb"] == "state.get" {
+                            continue;
+                        }
+                        g.lock().unwrap().push(v.clone());
+                        if let Some((wait, ok)) = answer {
+                            tokio::time::sleep(wait).await;
+                            let r = json!({"type":"result","id":v["id"],"ok":ok});
+                            let _ = ws.send(Message::text(r.to_string())).await;
+                        }
                     }
                     c.fetch_add(1, Ordering::SeqCst);
                 });
@@ -518,6 +656,7 @@ mod tests {
             port,
             accepts,
             closed,
+            got,
             task,
         }
     }
@@ -578,7 +717,27 @@ mod tests {
         tray: watch::Sender<bool>,
         sim: watch::Sender<Option<SimKind>>,
         _extras: watch::Sender<SimExtras>,
+        cmds: mpsc::Sender<Value>,
         task: JoinHandle<()>,
+    }
+
+    impl H {
+        async fn cmd(&self, id: &str, verb: &str, args: Value) {
+            let v = json!({"type":"cmd","id":id,"verb":verb,"args":args});
+            self.cmds.send(v).await.unwrap();
+        }
+
+        /// Waits for a block whose `last` is `(id, ok, code)`.
+        async fn last_is(&mut self, id: &str, ok: bool, code: Option<&str>) {
+            let want = GsxLast {
+                id: id.into(),
+                ok,
+                code: code.map(str::to_string),
+            };
+            let is = |f: &Option<GsxFeed>| f.as_ref().and_then(|f| f.block.last.as_ref()) == Some(&want);
+            let got = tokio::time::timeout(Duration::from_secs(5), self.out.wait_for(is));
+            got.await.expect("no such last").unwrap();
+        }
     }
 
     impl Drop for H {
@@ -594,6 +753,7 @@ mod tests {
         let (tray, tray_rx) = watch::channel(true);
         let (sim, sim_rx) = watch::channel(Some(o.sim));
         let (extras, extras_rx) = watch::channel(SimExtras::default());
+        let (cmds, cmds_rx) = mpsc::channel(16);
         let installed = o.installed;
         let port = o.port;
         let cfg = GsxRunnerCfg {
@@ -608,6 +768,7 @@ mod tests {
             },
             posted_file: o.file,
             timing: o.timing,
+            cmds: cmds_rx,
         };
         let task = tokio::spawn(run(cfg, ApiClient::new(&app.uri()), out_tx));
         H {
@@ -617,6 +778,7 @@ mod tests {
             tray,
             sim,
             _extras: extras,
+            cmds,
             task,
         }
     }
@@ -990,6 +1152,122 @@ mod tests {
         n_posts(&a, 1).await;
         quiet().await;
         assert_eq!(posts(&a).await.len(), 1);
+    }
+
+    async fn gsx_answering(wait_ms: u64) -> FakeGsx {
+        let script = vec![(vec![HELLO.into(), snapshot("D 7")], false)];
+        fake_gsx_answering(script, Some((Duration::from_millis(wait_ms), true))).await
+    }
+
+    fn sent(g: &FakeGsx) -> Vec<Value> {
+        g.got.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn a_gate_runs_on_gsx_and_its_result_lands_on_the_block() {
+        let g = gsx_answering(0).await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let mut h = start(&a, opts(g.port));
+        h.out.wait_for(Option::is_some).await.unwrap();
+        h.cmd("c1", "gsx.gate", json!({"gate":"D 8"})).await;
+        h.last_is("c1", true, None).await;
+        let got = sent(&g);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["verb"], "gate.select");
+        assert_eq!(got[0]["args"]["gate"], "D 8");
+        h.cmd("c2", "gsx.simbrief", json!({})).await;
+        h.last_is("c2", true, None).await;
+        assert_eq!(sent(&g)[1]["args"]["command"], "RELOAD_SIMBRIEF");
+    }
+
+    #[tokio::test]
+    async fn a_gate_gsx_does_not_list_is_unknown_and_not_sent() {
+        let g = gsx_answering(0).await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let mut h = start(&a, opts(g.port));
+        h.out.wait_for(Option::is_some).await.unwrap();
+        h.cmd("c1", "gsx.gate", json!({"gate":"Gate 14"})).await;
+        h.last_is("c1", false, Some("unknown_gate")).await;
+        h.cmd("c2", "gsx.gate", json!({"gate":"d 8"})).await;
+        h.last_is("c2", false, Some("unknown_gate")).await;
+        assert!(sent(&g).is_empty(), "GSX was never asked");
+    }
+
+    #[tokio::test]
+    async fn a_second_command_while_one_runs_is_busy() {
+        let g = gsx_answering(400).await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let mut h = start(&a, opts(g.port));
+        h.out.wait_for(Option::is_some).await.unwrap();
+        h.cmd("c1", "gsx.gate", json!({"gate":"D 8"})).await;
+        until("c1 at GSX", async || sent(&g).len() == 1).await;
+        h.cmd("c2", "gsx.simbrief", json!({})).await;
+        h.last_is("c2", false, Some("busy")).await;
+        h.last_is("c1", true, None).await;
+        assert_eq!(sent(&g).len(), 1, "c2 never reached GSX");
+    }
+
+    #[tokio::test]
+    async fn commands_while_not_reading_are_not_run() {
+        let g = gsx_answering(0).await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let o = Opts {
+            features: Some((true, false)),
+            ..opts(g.port)
+        };
+        let h = start(&a, o);
+        n_posts(&a, 1).await;
+        h.cmd("c1", "gsx.gate", json!({"gate":"D 8"})).await;
+        h.cmd("c2", "gsx.simbrief", json!({})).await;
+        quiet().await;
+        assert!(sent(&g).is_empty());
+        assert_eq!(*h.out.borrow(), None);
+    }
+
+    #[tokio::test]
+    async fn services_and_pushback_never_reach_gsx() {
+        let g = gsx_answering(0).await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let mut h = start(&a, opts(g.port));
+        h.out.wait_for(Option::is_some).await.unwrap();
+        h.cmd("c1", "gsx.service", json!({"service":"Boarding"})).await;
+        h.cmd("c2", "gsx.push", json!({})).await;
+        h.cmd("c3", "gsx.gate", json!({"gate":"D 8"})).await;
+        h.last_is("c3", true, None).await;
+        assert_eq!(sent(&g).len(), 1, "only the gate");
+    }
+
+    #[tokio::test]
+    async fn gsx_read_off_holds_until_the_next_ticket() {
+        let g = gsx_answering(0).await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let mut h = start(&a, opts(g.port));
+        h.out.wait_for(Option::is_some).await.unwrap();
+        h.cmd("r1", "gsx.read", json!({"on":false})).await;
+        h.out.wait_for(Option::is_none).await.unwrap();
+        n_posts(&a, 2).await;
+        assert_eq!(health(&posts(&a).await[1])["reading"], false);
+        quiet().await;
+        assert_eq!(*h.out.borrow(), None, "still off");
+        // The next ticket wins again.
+        h.features.send_replace(Some((true, true)));
+        h.out.wait_for(Option::is_some).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gsx_read_on_reads_against_the_ticket_and_says_ok() {
+        let g = gsx_answering(0).await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let o = Opts {
+            features: Some((true, false)),
+            ..opts(g.port)
+        };
+        let mut h = start(&a, o);
+        n_posts(&a, 1).await;
+        h.cmd("r1", "gsx.read", json!({"on":true})).await;
+        h.last_is("r1", true, None).await;
+        h.features.send_replace(Some((true, false)));
+        h.out.wait_for(Option::is_none).await.unwrap();
     }
 
     #[test]

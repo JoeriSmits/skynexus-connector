@@ -126,6 +126,11 @@ impl GsxClient {
         self.read_json().await
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_result_timeout(&mut self, d: Duration) {
+        self.result_timeout = d;
+    }
+
     /// Sends `verb` with `args` and waits for the `result` with the same id.
     /// Other messages in the meantime are kept for `next`.
     pub async fn command(&mut self, verb: &str, args: Value) -> anyhow::Result<CommandResult> {

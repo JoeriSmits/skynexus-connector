@@ -5,7 +5,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::api::{ApiClient, Credential, Features};
@@ -117,6 +117,9 @@ struct Tasks {
 /// How long Quit waits for a sign-out revoke still in flight.
 pub const REVOKE_WAIT_ON_QUIT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Relay commands waiting for the GSX runner; more are dropped.
+const GSX_CMD_QUEUE: usize = 16;
+
 pub struct Engine {
     cfg: Arc<Config>,
     api: ApiClient,
@@ -154,6 +157,9 @@ pub struct Engine {
     read_gsx: watch::Sender<bool>,
     /// What the GSX runner reads, for the own-ship frames.
     gsx: watch::Sender<Option<GsxFeed>>,
+    /// Where the relay puts `cmd` messages for the GSX runner; replaced
+    /// when the runner starts.
+    gsx_cmds: Mutex<mpsc::Sender<serde_json::Value>>,
 }
 
 impl Engine {
@@ -193,6 +199,7 @@ impl Engine {
             gsx_features: watch::channel(None).0,
             read_gsx: watch::channel(true).0,
             gsx: watch::channel(None).0,
+            gsx_cmds: Mutex::new(mpsc::channel(1).0),
         })
     }
 
@@ -428,6 +435,11 @@ impl Engine {
             probe,
             posted_file,
             timing: GsxTiming::default(),
+            cmds: {
+                let (tx, rx) = mpsc::channel(GSX_CMD_QUEUE);
+                *self.gsx_cmds.lock().unwrap() = tx;
+                rx
+            },
         };
         let task = self.rt.spawn(gsx_runner::run(cfg, self.api.clone(), self.gsx.clone()));
         if let Some(old) = self.tasks.lock().unwrap().gsx.replace(task) {
@@ -447,6 +459,7 @@ impl Engine {
             frames: self.frames.subscribe(),
             state: self.relay_state.clone(),
             timing: RelayTiming::default(),
+            cmds: Some(self.gsx_cmds.lock().unwrap().clone()),
         };
         let task = self.rt.spawn(async move {
             match relay.run().await {

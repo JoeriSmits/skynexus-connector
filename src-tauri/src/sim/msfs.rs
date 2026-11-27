@@ -263,7 +263,6 @@ impl MsfsSim {
         };
         if hr != S_OK {
             log::debug!("msfs: GSX L:var request failed ({hr:#x})");
-            return;
         }
     }
 

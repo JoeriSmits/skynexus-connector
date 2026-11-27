@@ -20,6 +20,8 @@
 //! - Aircraft title: the `TITLE` string in a definition of its own, once
 //!   per second with the changed-only flag (one answer per aircraft loaded),
 //!   for the TechLog presence check.
+//! - GSX L:vars: their own definition, every 5 s, for the GSX integration.
+//!   If the definition is refused the extras stay `None`.
 //! - Flight or menu: `RequestSystemState("Sim")` every 2 s. In the menus and
 //!   while a flight loads there is no user aircraft, so the requests above
 //!   get no answers; this one does, which keeps the connection from looking
@@ -36,7 +38,7 @@ use libloading::Library;
 
 use super::msfs_proto::*;
 use super::rate::{RateMode, RateSelector};
-use super::{Sim, SimError};
+use super::{Sim, SimError, SimExtras};
 use crate::frame::{now_ms, Frame, Own, SimKind};
 
 type Handle = *mut c_void;
@@ -89,6 +91,10 @@ pub struct MsfsSim {
     own: Option<Own>,
     /// The loaded aircraft's `TITLE`; None outside a flight.
     title: Option<String>,
+    /// GSX L:vars; all None until read, or if the definition was refused.
+    extras: SimExtras,
+    /// False when the GSX definition failed; nothing is requested then.
+    gsx_ok: bool,
     /// The last "Sim" system state: None until MSFS first answers.
     in_flight: Option<bool>,
     next_traffic_request: Instant,
@@ -208,6 +214,8 @@ impl MsfsSim {
             traffic: TrafficAssembler::default(),
             own: None,
             title: None,
+            extras: SimExtras::default(),
+            gsx_ok: false,
             in_flight: None,
             next_traffic_request: Instant::now(),
             last_answer: Instant::now(),
@@ -219,7 +227,38 @@ impl MsfsSim {
         sim.define(DEF_TITLE, &TITLE_DATUMS)?;
         sim.request_own()?;
         sim.request_title()?;
+        sim.start_gsx();
         Ok(sim)
+    }
+
+    /// Defines and requests the GSX L:vars every 5 s. Any failure only
+    /// disables them (extras stay None); own-ship reading is unaffected.
+    fn start_gsx(&mut self) {
+        self.gsx_ok = false;
+        if let Err(e) = self.define(DEF_GSX, &GSX_DATUMS) {
+            log::debug!("msfs: GSX L:vars unavailable ({e})");
+            return;
+        }
+        // SAFETY: open handle, our own definition and request ids. The
+        // interval skips 4 once-per-second events, so one answer per 5 s.
+        let hr = unsafe {
+            (self.api.request_data_on_sim_object)(
+                self.handle,
+                REQ_GSX,
+                DEF_GSX,
+                OBJECT_ID_USER,
+                PERIOD_SECOND,
+                0,
+                0,
+                4,
+                0,
+            )
+        };
+        if hr != S_OK {
+            log::debug!("msfs: GSX L:var request failed ({hr:#x})");
+            return;
+        }
+        self.gsx_ok = true;
     }
 
     /// (Re)starts the title request: once per second, answered only when the
@@ -350,6 +389,10 @@ impl Sim for MsfsSim {
         self.title.clone().filter(|_| self.flying())
     }
 
+    fn extras(&self) -> SimExtras {
+        self.extras.clone()
+    }
+
     fn poll(&mut self) -> Result<Option<Frame>, SimError> {
         let now = Instant::now();
         if now >= self.next_traffic_request {
@@ -385,6 +428,16 @@ impl Sim for MsfsSim {
                         if od.request_id == REQ_TITLE {
                             self.title = decode_title(od.data);
                         }
+                        if od.request_id == REQ_GSX && self.gsx_ok {
+                            self.extras = match decode_gsx(od.data) {
+                                Some((started, board, total)) => SimExtras {
+                                    couatl_started: Some(started),
+                                    pax_board: Some(board),
+                                    pax_total: Some(total),
+                                },
+                                None => SimExtras::default(),
+                            };
+                        }
                         if od.request_id == REQ_OWN {
                             if let Some(own) = decode_own(od.data) {
                                 if self.rate.update(&own) != self.requested {
@@ -413,6 +466,7 @@ impl Sim for MsfsSim {
                                 // Back from the menus: ask for the new user aircraft.
                                 self.request_own().map_err(SimError::Other)?;
                                 self.request_title().map_err(SimError::Other)?;
+                                self.start_gsx();
                             }
                             if !flying {
                                 // The next flight starts at the air rate.

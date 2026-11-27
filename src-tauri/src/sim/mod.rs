@@ -50,6 +50,20 @@ pub trait Sim: Send {
     fn aircraft_title(&self) -> Option<String> {
         None
     }
+    /// GSX L:vars; all None unless MSFS has read them.
+    fn extras(&self) -> SimExtras {
+        SimExtras::default()
+    }
+}
+
+/// What the sim reports besides the own ship: GSX Pro's L:vars, read by
+/// MSFS every 5 s. None for a value that is unreadable (X-Plane, replays,
+/// a refused definition).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SimExtras {
+    pub couatl_started: Option<bool>,
+    pub pax_board: Option<u32>,
+    pub pax_total: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -219,7 +233,7 @@ fn connect(source: &Source) -> Result<Box<dyn Sim>, NoSim> {
 /// Runs on its own thread until `stop` is set: finds a sim, polls it, and
 /// hands paced frames to `out`, with the rate in Hz they are paced at.
 /// `interval` is the air interval. `title` gets the aircraft title each time
-/// it changes (None when there is none, or no sim).
+/// it changes (None when there is none, or no sim); `extras` likewise.
 pub fn run_driver(
     source: Source,
     interval: Duration,
@@ -227,7 +241,15 @@ pub fn run_driver(
     mut out: impl FnMut(&Frame, u32),
     mut state: impl FnMut(SimState),
     mut title: impl FnMut(Option<String>),
+    mut extras: impl FnMut(SimExtras),
 ) {
+    let mut last_extras = SimExtras::default();
+    let mut set_extras = |e: SimExtras| {
+        if e != last_extras {
+            last_extras = e.clone();
+            extras(e);
+        }
+    };
     let mut last_title: Option<String> = None;
     let mut set_title = |t: Option<String>| {
         if t != last_title {
@@ -278,6 +300,7 @@ pub fn run_driver(
         };
         let polled = active.poll();
         set_title(active.aircraft_title().filter(|_| active.flying()));
+        set_extras(active.extras());
         if active.flying() != flying {
             flying = !flying;
             let kind = active.kind();
@@ -304,6 +327,7 @@ pub fn run_driver(
             Err(SimError::Finished) => {
                 log::info!("sim: replay finished");
                 set_title(None);
+                set_extras(SimExtras::default());
                 state(SimState::Finished);
                 sim = None;
                 next_search = Instant::now() + Duration::from_secs(3600 * 24 * 365);
@@ -312,6 +336,7 @@ pub fn run_driver(
             Err(e) => {
                 log::info!("sim: lost ({e}); searching again");
                 set_title(None);
+                set_extras(SimExtras::default());
                 state(SimState::Searching);
                 sim = None;
                 last_reason.clear();
@@ -517,6 +542,7 @@ mod tests {
                 states.push(s);
             },
             |t| assert_eq!(t, None, "a replay has no aircraft title"),
+            |e| assert_eq!(e, SimExtras::default()),
         );
         assert!(matches!(
             states[1],

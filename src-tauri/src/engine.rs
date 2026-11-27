@@ -140,6 +140,8 @@ pub struct Engine {
     sim_on: watch::Sender<bool>,
     /// The loaded aircraft's title (MSFS `TITLE`); None for X-Plane and replays.
     aircraft: watch::Sender<Option<String>>,
+    /// GSX L:vars from MSFS, every 5 s; all None without them.
+    sim_extras: watch::Sender<sim::SimExtras>,
 }
 
 impl Engine {
@@ -174,6 +176,7 @@ impl Engine {
             tl: watch::channel(None).0,
             sim_on: watch::channel(false).0,
             aircraft: watch::channel(None).0,
+            sim_extras: watch::channel(sim::SimExtras::default()).0,
         })
     }
 
@@ -235,6 +238,11 @@ impl Engine {
         }
     }
 
+    /// Subscribes to the GSX L:vars the sim driver reads.
+    pub fn sim_extras(&self) -> watch::Receiver<sim::SimExtras> {
+        self.sim_extras.subscribe()
+    }
+
     fn start_sim(self: &Arc<Self>) {
         let source = match &self.cfg.replay {
             Some(path) => Source::Replay {
@@ -253,6 +261,7 @@ impl Engine {
         let tl = self.tl.subscribe();
         let sim_on = self.sim_on.clone();
         let aircraft = self.aircraft.clone();
+        let sim_extras = self.sim_extras.clone();
         let handle = std::thread::Builder::new()
             .name("sim-driver".into())
             .spawn(move || {
@@ -287,6 +296,9 @@ impl Engine {
                     },
                     |title| {
                         aircraft.send_replace(title);
+                    },
+                    |e| {
+                        sim_extras.send_replace(e);
                     },
                 );
             })

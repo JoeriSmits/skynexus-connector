@@ -48,6 +48,11 @@ pub struct Cli {
     #[arg(long, default_value_t = 1.0)]
     pub replay_speed: f64,
 
+    /// Record GSX Pro's local Remote API to FILE (JSONL) until Ctrl+C. Runs
+    /// without tray, pairing or relay.
+    #[arg(long, value_name = "FILE")]
+    pub gsx_record: Option<PathBuf>,
+
     /// Run without the tray: log status to the terminal and pair on the command line.
     #[arg(long)]
     pub headless: bool,
@@ -95,6 +100,8 @@ pub struct Config {
     pub replay_loop: bool,
     pub replay_speed: f64,
     pub headless: bool,
+    /// Capture mode: record the GSX Remote API to this file.
+    pub gsx_record: Option<PathBuf>,
     pub offline: bool,
     pub print_frames: bool,
     pub ephemeral: bool,
@@ -140,6 +147,7 @@ impl Config {
                 1.0
             },
             headless: cli.headless,
+            gsx_record: cli.gsx_record,
             offline: cli.offline,
             print_frames: cli.print_frames || cli.offline,
             ephemeral: cli.ephemeral,

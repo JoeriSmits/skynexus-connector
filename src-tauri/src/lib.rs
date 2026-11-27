@@ -11,6 +11,7 @@ pub mod config;
 pub mod credentials;
 pub mod engine;
 pub mod frame;
+pub mod gsx;
 pub mod logs;
 pub mod msfs_launch;
 pub mod pairing;
@@ -67,6 +68,10 @@ pub fn run() {
         remove_msfs_entries();
         return;
     }
+    if let Some(path) = cfg.gsx_record.clone() {
+        run_gsx_record(&path);
+        return;
+    }
     log::info!(
         "SkyNexus Connector {} ({}{})",
         env!("CARGO_PKG_VERSION"),
@@ -90,6 +95,21 @@ pub fn run() {
         return;
     }
     run_tray(&rt, engine);
+}
+
+/// `--gsx-record FILE`: headless capture of GSX's Remote API, no tray,
+/// pairing or relay. Stops on Ctrl+C.
+fn run_gsx_record(path: &std::path::Path) {
+    let port = gsx::port::remote_port(&gsx::port::ini_path());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    if let Err(e) = rt.block_on(gsx::record::run(path, port)) {
+        eprintln!("gsx-record: {e:#}");
+        std::process::exit(1);
+    }
 }
 
 /// Logs each change of the tray lines, in both modes.

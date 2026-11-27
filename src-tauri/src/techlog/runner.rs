@@ -8,8 +8,9 @@
 //!   TechLog is present so the server knows the data is still fresh.
 //! - After SkyNexus accepted a snapshot, its short hash goes on `tl_out` for
 //!   the own-ship frame; after a health-only POST, `tl_out` is cleared.
-//! - Runs only while the tray switch is on, a credential is there and the
-//!   last ticket said `features.techlog`. A 503 `disabled` stops it until the
+//! - Runs only while the tray switch is on or the last ticket said
+//!   `features.techlogRead` (turned on in the EFB), a credential is there
+//!   and the last ticket said `features.techlog` (the kill switch). A 503 `disabled` stops it until the
 //!   next ticket; a 401 stops it until the credential changes.
 //!
 //! The snapshot body is never logged.
@@ -22,14 +23,14 @@ use tokio::time::{sleep, Instant};
 
 use super::client::{Code, TechlogClient};
 use super::snapshot::{self, Snapshot};
-use crate::api::{ApiClient, ApiError};
+use crate::api::{ApiClient, ApiError, Features};
 
 /// The server refuses bodies above this many bytes.
 pub const MAX_BODY_BYTES: usize = 32_768;
 /// The health object's schema version.
 pub const HEALTH_SCHEMA: u8 = 1;
 /// The longest `Retry-After` honoured from the TechLog route.
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
+pub(super) const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
 
 /// Resend an unchanged `OK` snapshot this often: well inside the EFB's 30 min freshness window,
 /// so data the pilot is looking at never ages to stale while TechLog is up.
@@ -58,8 +59,8 @@ impl Default for RunnerTiming {
 pub struct RunnerCfg {
     /// The connector credential; None while signed out.
     pub credential: watch::Receiver<Option<String>>,
-    /// `features.techlog` of every ticket, published on each renewal.
-    pub features: watch::Receiver<bool>,
+    /// `features` of every ticket, published on each renewal.
+    pub features: watch::Receiver<Features>,
     pub timing: RunnerTiming,
 }
 
@@ -100,7 +101,7 @@ impl Tracker {
 }
 
 /// The server's pattern for `techlogVersion`: `^\d{1,4}(\.\d{1,4}){1,3}$`.
-fn valid_version(v: &str) -> bool {
+pub(super) fn valid_version(v: &str) -> bool {
     let parts: Vec<&str> = v.split('.').collect();
     (2..=4).contains(&parts.len())
         && parts
@@ -120,7 +121,7 @@ fn checked_version(code: Code, version: Option<String>) -> (Code, Option<String>
 }
 
 /// The `health` object. Optional keys are left out, never sent as null.
-fn health(code: &Code, techlog_version: Option<&str>) -> Value {
+pub(super) fn health(code: &Code, techlog_version: Option<&str>) -> Value {
     let mut h = Map::new();
     h.insert("code".into(), json!(code.as_str()));
     if let Some(p) = code.path() {
@@ -167,7 +168,7 @@ fn publish(tl_out: &watch::Sender<Option<String>>, v: Option<String>) {
     });
 }
 
-fn describe(code: &Code) -> String {
+pub(super) fn describe(code: &Code) -> String {
     match (code.path(), code.http_status()) {
         (Some(p), _) => format!("{} at {p}", code.as_str()),
         (_, Some(s)) => format!("{} {s}", code.as_str()),
@@ -200,8 +201,9 @@ pub async fn run(
     let mut post_failing: Option<std::mem::Discriminant<ApiError>> = None;
     loop {
         let credential = cfg.credential.borrow_and_update().clone();
-        let feature = *cfg.features.borrow_and_update();
-        let on = *enabled.borrow_and_update();
+        let features = *cfg.features.borrow_and_update();
+        let feature = features.techlog;
+        let on = *enabled.borrow_and_update() || features.techlog_read;
         if blocked(on, credential.as_ref(), refused.as_ref(), feature, server_off) {
             publish(&tl_out, None);
             // Start over when it runs again, so the current state is sent.
@@ -369,7 +371,7 @@ mod tests {
         tl: watch::Receiver<Option<String>>,
         enabled: watch::Sender<bool>,
         credential: watch::Sender<Option<String>>,
-        features: watch::Sender<bool>,
+        features: watch::Sender<Features>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -380,10 +382,18 @@ mod tests {
     }
 
     fn start(techlog: &str, app: &MockServer, timing: RunnerTiming, feature: bool) -> Harness {
+        let f = Features {
+            techlog: feature,
+            techlog_read: false,
+        };
+        start_with(techlog, app, timing, f, true)
+    }
+
+    fn start_with(techlog: &str, app: &MockServer, timing: RunnerTiming, f: Features, switch: bool) -> Harness {
         let (tl_tx, tl) = watch::channel(None);
-        let (enabled, enabled_rx) = watch::channel(true);
+        let (enabled, enabled_rx) = watch::channel(switch);
         let (credential, credential_rx) = watch::channel(Some("snc_1".to_string()));
-        let (features, features_rx) = watch::channel(feature);
+        let (features, features_rx) = watch::channel(f);
         let cfg = RunnerCfg {
             credential: credential_rx,
             features: features_rx,
@@ -542,8 +552,44 @@ mod tests {
         assert_eq!(hits(&tl, "/api/ping").await, 0);
         assert!(posts(&a).await.is_empty());
         // the next ticket allows it
-        h.features.send_replace(true);
+        h.features.send_replace(allowed());
         until("a post", async || posts(&a).await.len() == 1).await;
+    }
+
+    fn allowed() -> Features {
+        Features {
+            techlog: true,
+            techlog_read: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn techlog_read_turns_the_reader_on_without_the_tray_switch() {
+        let tl = techlog_with(&fixture(STATE)).await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let h = start_with(&tl.uri(), &a, fast(), allowed(), false);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(hits(&tl, "/api/ping").await, 0, "switch off, not opted in");
+        let read = Features {
+            techlog_read: true,
+            ..allowed()
+        };
+        h.features.send_replace(read);
+        until("a post", async || posts(&a).await.len() == 1).await;
+        assert!(hits(&tl, "/api/state").await >= 1, "the full read");
+        assert_eq!(code(&posts(&a).await[0]), "OK");
+        until("tl", async || h.tl.borrow().is_some()).await;
+        // the kill switch wins over the opt-in
+        let killed = Features {
+            techlog: false,
+            techlog_read: true,
+        };
+        h.features.send_replace(killed);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let n = hits(&tl, "/api/ping").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(hits(&tl, "/api/ping").await, n, "stopped");
+        assert_eq!(*h.tl.borrow(), None);
     }
 
     #[tokio::test]
@@ -568,7 +614,7 @@ mod tests {
         assert_eq!(hits(&tl, "/api/ping").await, reads, "stopped reading");
         assert_eq!(*h.tl.borrow(), None);
         // a renewed ticket, still allowed
-        h.features.send_replace(true);
+        h.features.send_replace(allowed());
         until("the post after renewal", async || posts(&a).await.len() == 2).await;
         until("tl", async || h.tl.borrow().is_some()).await;
     }

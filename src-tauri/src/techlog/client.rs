@@ -102,7 +102,27 @@ impl TechlogClient {
         }
     }
 
+    /// The presence check: `/api/ping` only, never `/api/state`. Returns the
+    /// code and the version the ping reported, if any (also while starting).
+    pub async fn probe(&self) -> (Code, Option<String>) {
+        match self.fetch_ping().await {
+            Ok(p) => {
+                let version = p.version.clone();
+                match identify(p) {
+                    Ok(_) => (Code::Ok, version),
+                    Err(Code::Starting) => (Code::Starting, version),
+                    Err(code) => (code, None),
+                }
+            }
+            Err(code) => (code, None),
+        }
+    }
+
     async fn ping(&self) -> Result<Ping, Code> {
+        identify(self.fetch_ping().await?)
+    }
+
+    async fn fetch_ping(&self) -> Result<Ping, Code> {
         let url = self.base.join("api/ping").expect("ping url");
         let resp = self.http.get(url).send().await.map_err(ping_transport_code)?;
         let status = resp.status();
@@ -110,14 +130,7 @@ impl TechlogClient {
             return Err(Code::Http(status.as_u16()));
         }
         let body = resp.text().await.map_err(ping_transport_code)?;
-        let ping: Ping = serde_json::from_str(&body).map_err(|_| Code::NotTechlog)?;
-        if ping.engine == Some(false) {
-            return Err(Code::Starting);
-        }
-        if ping.app.as_deref() != Some("TechLog") {
-            return Err(Code::NotTechlog);
-        }
-        Ok(ping)
+        serde_json::from_str(&body).map_err(|_| Code::NotTechlog)
     }
 
     async fn state(&self) -> Result<State, Code> {
@@ -133,6 +146,29 @@ impl TechlogClient {
         let body = resp.text().await.map_err(transport_code)?;
         parse_state(&body).map_err(|e| Code::Schema(e.path))
     }
+}
+
+/// Whether a ping came from TechLog with its engine up. The app is checked
+/// first: a ping naming another app is never TechLog, `engine:false` or not.
+/// TechLog's own proxy answers `{"ok":true,"engine":false}` with no `app`
+/// while its engine starts (contract, `Proxy.cs:153-165`), so that exact
+/// shape still counts as starting.
+fn identify(ping: Ping) -> Result<Ping, Code> {
+    let app = ping.app.as_deref();
+    if app.is_some_and(|a| a != "TechLog") {
+        return Err(Code::NotTechlog);
+    }
+    if ping.engine == Some(false) {
+        return if ping.ok {
+            Err(Code::Starting)
+        } else {
+            Err(Code::NotTechlog)
+        };
+    }
+    if app != Some("TechLog") {
+        return Err(Code::NotTechlog);
+    }
+    Ok(ping)
 }
 
 /// A transport failure during the `/api/ping` step. A timeout or a connect
@@ -259,6 +295,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn another_app_starting_is_not_techlog() {
+        for body in [
+            r#"{"ok":true,"app":"Other","engine":false}"#,
+            r#"{"ok":false,"engine":false}"#,
+            r#"{"engine":false}"#,
+        ] {
+            let s = MockServer::start().await;
+            let resp = ResponseTemplate::new(200).set_body_string(body);
+            mock(&s, "/api/ping", resp).await;
+            assert_eq!(client(&s).read().await.0, Code::NotTechlog, "{body}");
+            assert_eq!(client(&s).probe().await.0, Code::NotTechlog, "{body}");
+        }
+        let s = MockServer::start().await;
+        let body = r#"{"ok":true,"app":"TechLog","engine":false}"#;
+        mock(&s, "/api/ping", ResponseTemplate::new(200).set_body_string(body)).await;
+        assert_eq!(client(&s).probe().await.0, Code::Starting);
+    }
+
+    #[tokio::test]
     async fn ping_non_2xx_is_http() {
         let s = MockServer::start().await;
         mock(&s, "/api/ping", ResponseTemplate::new(404)).await;
@@ -282,6 +337,31 @@ mod tests {
         let s = MockServer::start().await;
         mock(&s, "/api/ping", ping_ok().set_delay(Duration::from_secs(2))).await;
         assert_eq!(client(&s).read().await.0, Code::NotRunning);
+    }
+
+    #[tokio::test]
+    async fn probe_pings_only() {
+        let s = MockServer::start().await;
+        mock(&s, "/api/ping", ping_ok()).await;
+        let (code, version) = client(&s).probe().await;
+        assert_eq!(code, Code::Ok);
+        assert_eq!(version.as_deref(), Some("2.1.2"));
+        let reqs = s.received_requests().await.unwrap();
+        assert!(reqs.iter().all(|r| r.url.path() == "/api/ping"));
+
+        let s = MockServer::start().await;
+        let starting = r#"{"ok":true,"engine":false,"version":"2.1"}"#;
+        let resp = ResponseTemplate::new(200).set_body_string(starting);
+        mock(&s, "/api/ping", resp).await;
+        let (code, version) = client(&s).probe().await;
+        assert_eq!(code, Code::Starting);
+        assert_eq!(version.as_deref(), Some("2.1"));
+
+        let s = MockServer::start().await;
+        let other = r#"{"ok":true,"app":"Other","version":"1.0"}"#;
+        let resp = ResponseTemplate::new(200).set_body_string(other);
+        mock(&s, "/api/ping", resp).await;
+        assert_eq!(client(&s).probe().await, (Code::NotTechlog, None));
     }
 
     #[tokio::test]

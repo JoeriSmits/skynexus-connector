@@ -41,8 +41,8 @@ Unsigned works, with SmartScreen and Gatekeeper warnings.
 
    ```sh
    git checkout main && git pull
-   git tag v0.1.4
-   git push origin v0.1.4
+   git tag v0.1.5
+   git push origin v0.1.5
    ```
 
    The tag must match the version (`v` + `version`), or the workflow stops.

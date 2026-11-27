@@ -47,6 +47,7 @@ pub const SYSTEM_STATE_SIM: &str = "Sim";
 // SIMCONNECT_DATATYPE
 pub const DATATYPE_FLOAT64: u32 = 4;
 pub const DATATYPE_STRING32: u32 = 6;
+pub const DATATYPE_STRING256: u32 = 9;
 
 // SIMCONNECT_PERIOD
 pub const PERIOD_SECOND: u32 = 4;
@@ -116,6 +117,8 @@ pub const REQ_OWN: u32 = 1;
 pub const REQ_TRAFFIC_AIRCRAFT: u32 = 2;
 pub const REQ_TRAFFIC_HELICOPTER: u32 = 3;
 pub const REQ_SIM_STATE: u32 = 4;
+pub const DEF_TITLE: u32 = 3;
+pub const REQ_TITLE: u32 = 5;
 
 /// Traffic radius in metres (the API maximum is 200 000).
 pub const TRAFFIC_RADIUS_M: u32 = 80_000;
@@ -178,6 +181,25 @@ pub const TRAFFIC_DATUMS: [Datum; 8] = [
     ATC_ID,
 ];
 pub const TRAFFIC_DATA_LEN: usize = 7 * 8 + 32;
+
+/// The loaded aircraft's title (for example "FenixA320 Fenix House Livery"),
+/// in a definition of its own: asked once per second with the changed-only
+/// flag, so it costs one message per aircraft, not 256 bytes per frame.
+pub const TITLE_DATUMS: [Datum; 1] = [Datum {
+    name: "TITLE",
+    units: None,
+    datatype: DATATYPE_STRING256,
+    epsilon: 0.0,
+}];
+pub const TITLE_DATA_LEN: usize = 256;
+
+/// The title from a `TITLE_DATUMS` block; None when empty.
+pub fn decode_title(d: &[u8]) -> Option<String> {
+    let raw = d.get(..TITLE_DATA_LEN)?;
+    let end = raw.iter().position(|c| *c == 0).unwrap_or(raw.len());
+    let s = String::from_utf8_lossy(&raw[..end]).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
 
 fn u32_at(b: &[u8], off: usize) -> Option<u32> {
     Some(u32::from_le_bytes(b.get(off..off + 4)?.try_into().ok()?))
@@ -411,11 +433,46 @@ pub(crate) mod tests {
     fn data_lengths_match_the_definitions() {
         let len = |ds: &[Datum]| -> usize {
             ds.iter()
-                .map(|d| if d.datatype == DATATYPE_FLOAT64 { 8 } else { 32 })
+                .map(|d| match d.datatype {
+                    DATATYPE_FLOAT64 => 8,
+                    DATATYPE_STRING256 => 256,
+                    _ => 32,
+                })
                 .sum()
         };
         assert_eq!(len(&OWN_DATUMS), OWN_DATA_LEN);
         assert_eq!(len(&TRAFFIC_DATUMS), TRAFFIC_DATA_LEN);
+        assert_eq!(len(&TITLE_DATUMS), TITLE_DATA_LEN);
+    }
+
+    fn title_block(title: &str) -> Vec<u8> {
+        let mut d = vec![0u8; TITLE_DATA_LEN];
+        d[..title.len()].copy_from_slice(title.as_bytes());
+        d
+    }
+
+    #[test]
+    fn decodes_the_aircraft_title() {
+        let t = "FenixA320 Fenix House Livery";
+        let m = object_message(
+            RECV_ID_SIMOBJECT_DATA,
+            REQ_TITLE,
+            OBJECT_ID_USER,
+            DEF_TITLE,
+            1,
+            1,
+            &title_block(t),
+        );
+        let od = parse_object_data(&m).unwrap();
+        assert_eq!(od.request_id, REQ_TITLE);
+        assert_eq!(decode_title(od.data).as_deref(), Some(t));
+        assert_eq!(decode_title(&title_block("  ")), None, "blank");
+        assert_eq!(decode_title(&title_block("")), None);
+        assert_eq!(decode_title(&[0u8; 10]), None, "short block");
+        let full = vec![b'A'; TITLE_DATA_LEN];
+        assert_eq!(decode_title(&full).unwrap().len(), 256, "no NUL");
+        let utf8 = decode_title(&title_block("Airbus A320 Néo"));
+        assert_eq!(utf8.as_deref(), Some("Airbus A320 Néo"));
     }
 
     #[test]

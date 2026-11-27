@@ -45,6 +45,11 @@ pub trait Sim: Send {
     fn flying(&self) -> bool {
         true
     }
+    /// The loaded aircraft's title, for the TechLog presence check. Only
+    /// MSFS has one (its `TITLE`); None outside a flight.
+    fn aircraft_title(&self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -213,14 +218,23 @@ fn connect(source: &Source) -> Result<Box<dyn Sim>, NoSim> {
 
 /// Runs on its own thread until `stop` is set: finds a sim, polls it, and
 /// hands paced frames to `out`, with the rate in Hz they are paced at.
-/// `interval` is the air interval.
+/// `interval` is the air interval. `title` gets the aircraft title each time
+/// it changes (None when there is none, or no sim).
 pub fn run_driver(
     source: Source,
     interval: Duration,
     stop: &AtomicBool,
     mut out: impl FnMut(&Frame, u32),
     mut state: impl FnMut(SimState),
+    mut title: impl FnMut(Option<String>),
 ) {
+    let mut last_title: Option<String> = None;
+    let mut set_title = |t: Option<String>| {
+        if t != last_title {
+            last_title = t.clone();
+            title(t);
+        }
+    };
     let mut pacer = Pacer::new(interval);
     let mut sim: Option<Box<dyn Sim>> = None;
     let mut next_search = Instant::now();
@@ -263,6 +277,7 @@ pub fn run_driver(
             continue;
         };
         let polled = active.poll();
+        set_title(active.aircraft_title().filter(|_| active.flying()));
         if active.flying() != flying {
             flying = !flying;
             let kind = active.kind();
@@ -288,6 +303,7 @@ pub fn run_driver(
             Ok(None) => {}
             Err(SimError::Finished) => {
                 log::info!("sim: replay finished");
+                set_title(None);
                 state(SimState::Finished);
                 sim = None;
                 next_search = Instant::now() + Duration::from_secs(3600 * 24 * 365);
@@ -295,6 +311,7 @@ pub fn run_driver(
             }
             Err(e) => {
                 log::info!("sim: lost ({e}); searching again");
+                set_title(None);
                 state(SimState::Searching);
                 sim = None;
                 last_reason.clear();
@@ -499,6 +516,7 @@ mod tests {
                 }
                 states.push(s);
             },
+            |t| assert_eq!(t, None, "a replay has no aircraft title"),
         );
         assert!(matches!(
             states[1],

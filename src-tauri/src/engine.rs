@@ -1,5 +1,5 @@
 //! The engine ties the parts together and owns their lifetimes: the sim
-//! driver thread, the pairing task, the relay task and the TechLog runner. The tray and the
+//! driver thread, the pairing task, the relay task and the TechLog runner and presence check. The tray and the
 //! headless mode are both thin shells around it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::api::{ApiClient, Credential};
+use crate::api::{ApiClient, Credential, Features};
 use crate::config::Config;
 use crate::credentials::CredentialStore;
 use crate::frame::{Frame, SimKind};
@@ -16,6 +16,7 @@ use crate::pairing::{self, PairEvent, PollTiming};
 use crate::relay::{FrameSlot, Relay, RelayExit, RelayState, RelayTiming};
 use crate::sim::{self, SimState, Source};
 use crate::techlog::client::{TechlogClient, DEFAULT_BASE};
+use crate::techlog::presence::{self, PresenceCfg};
 use crate::techlog::runner::{self, RunnerCfg, RunnerTiming};
 use crate::ticket::TicketManager;
 
@@ -104,6 +105,7 @@ struct Tasks {
     pairing: Option<JoinHandle<()>>,
     relay: Option<JoinHandle<()>>,
     techlog: Option<JoinHandle<()>>,
+    presence: Option<JoinHandle<()>>,
     sim: Option<std::thread::JoinHandle<()>>,
     /// Signals when the sign-out revoke finished, so Quit can wait for it.
     revoke_done: Option<std::sync::mpsc::Receiver<()>>,
@@ -127,13 +129,17 @@ pub struct Engine {
     credential: Mutex<Option<Credential>>,
     /// The credential for the TechLog runner; None while signed out.
     credential_tx: watch::Sender<Option<String>>,
-    /// `features.techlog` of every ticket the relay fetches.
-    techlog_features: watch::Sender<bool>,
+    /// `features` of every ticket the relay fetches.
+    techlog_features: watch::Sender<Features>,
     /// The "Read TechLog" switch; off until the tray turns it on.
     read_techlog: watch::Sender<bool>,
     /// The short hash of the TechLog snapshot SkyNexus last accepted, put on
     /// every own-ship frame.
     tl: watch::Sender<Option<String>>,
+    /// True while a sim is connected with a flight loaded.
+    sim_on: watch::Sender<bool>,
+    /// The loaded aircraft's title (MSFS `TITLE`); None for X-Plane and replays.
+    aircraft: watch::Sender<Option<String>>,
 }
 
 impl Engine {
@@ -163,9 +169,11 @@ impl Engine {
             stop: Arc::new(AtomicBool::new(false)),
             credential: Mutex::new(None),
             credential_tx: watch::channel(None).0,
-            techlog_features: watch::channel(false).0,
+            techlog_features: watch::channel(Features::default()).0,
             read_techlog: watch::channel(false).0,
             tl: watch::channel(None).0,
+            sim_on: watch::channel(false).0,
+            aircraft: watch::channel(None).0,
         })
     }
 
@@ -195,10 +203,11 @@ impl Engine {
     }
 
     /// The credential for the TechLog runner. Signing out also forgets the
-    /// last ticket's `features.techlog`, so another account waits for its own.
+    /// last ticket's `features` (`techlog` and `techlogRead`), so another
+    /// account waits for its own.
     fn set_credential(&self, c: Option<&Credential>) {
         if c.is_none() {
-            self.techlog_features.send_replace(false);
+            self.techlog_features.send_replace(Features::default());
         }
         self.credential_tx.send_replace(c.map(|c| c.credential.clone()));
     }
@@ -242,6 +251,8 @@ impl Engine {
         let print = self.cfg.print_frames;
         let offline = self.cfg.offline;
         let tl = self.tl.subscribe();
+        let sim_on = self.sim_on.clone();
+        let aircraft = self.aircraft.clone();
         let handle = std::thread::Builder::new()
             .name("sim-driver".into())
             .spawn(move || {
@@ -267,10 +278,15 @@ impl Engine {
                     |s| {
                         // A sim that left Connected must never have its last
                         // frame re-sent by a relay reconnect.
-                        if !matches!(s, SimState::Connected { .. }) {
+                        let connected = matches!(s, SimState::Connected { .. });
+                        if !connected {
                             frames.send_replace(None);
                         }
+                        sim_on.send_if_modified(|cur| std::mem::replace(cur, connected) != connected);
                         status.send_modify(|st| st.sim = s)
+                    },
+                    |title| {
+                        aircraft.send_replace(title);
                     },
                 );
             })
@@ -296,8 +312,9 @@ impl Engine {
         });
     }
 
-    /// Starts the TechLog runner. It reads nothing until the switch is on,
-    /// a credential is there and a ticket allowed it.
+    /// Starts the TechLog runner and the presence check. The runner reads
+    /// nothing until the switch is on, a credential is there and a ticket
+    /// allowed it; the presence check pings only while the runner is off.
     fn start_techlog(self: &Arc<Self>) {
         let cfg = RunnerCfg {
             credential: self.credential_tx.subscribe(),
@@ -313,6 +330,21 @@ impl Engine {
             self.read_techlog.subscribe(),
         ));
         if let Some(old) = self.tasks.lock().unwrap().techlog.replace(task) {
+            old.abort();
+        }
+        let cfg = PresenceCfg {
+            credential: self.credential_tx.subscribe(),
+            features: self.techlog_features.subscribe(),
+            read_switch: self.read_techlog.subscribe(),
+            sim: self.sim_on.subscribe(),
+            aircraft: self.aircraft.subscribe(),
+            every: presence::EVERY,
+            title_grace: presence::TITLE_GRACE,
+            backoff_max: presence::BACKOFF_MAX,
+        };
+        let client = TechlogClient::new(url::Url::parse(DEFAULT_BASE).expect("TechLog URL"));
+        let task = self.rt.spawn(presence::run(cfg, client, self.api.clone()));
+        if let Some(old) = self.tasks.lock().unwrap().presence.replace(task) {
             old.abort();
         }
     }
@@ -449,7 +481,7 @@ impl Engine {
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Relaxed);
         let mut t = self.tasks.lock().unwrap();
-        for task in [t.pairing.take(), t.relay.take(), t.techlog.take()]
+        for task in [t.pairing.take(), t.relay.take(), t.techlog.take(), t.presence.take()]
             .into_iter()
             .flatten()
         {
@@ -675,10 +707,14 @@ mod tests {
             credential: "snc_kept".into(),
             device_id: None,
         });
-        engine.techlog_features.send_replace(true);
+        let both = Features {
+            techlog: true,
+            techlog_read: true,
+        };
+        engine.techlog_features.send_replace(both);
         engine.sign_out();
         assert!(
-            !*engine.techlog_features.borrow(),
+            *engine.techlog_features.borrow() == Features::default(),
             "a new account waits for its own ticket"
         );
         assert_eq!(*engine.credential_tx.borrow(), None);

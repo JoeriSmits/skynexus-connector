@@ -159,7 +159,7 @@ pub struct Engine {
     gsx: watch::Sender<Option<GsxFeed>>,
     /// Where the relay puts `cmd` messages for the GSX runner; replaced
     /// when the runner starts.
-    gsx_cmds: Mutex<mpsc::Sender<serde_json::Value>>,
+    gsx_cmds: Mutex<mpsc::Sender<(tokio::time::Instant, serde_json::Value)>>,
 }
 
 impl Engine {

@@ -185,7 +185,8 @@ pub struct Relay {
     pub state: Arc<watch::Sender<RelayState>>,
     pub timing: RelayTiming,
     /// Where `cmd` messages from the account's viewers go (the GSX runner).
-    pub cmds: Option<mpsc::Sender<Value>>,
+    /// Each with the time it arrived, so a late one can be dropped.
+    pub cmds: Option<mpsc::Sender<(Instant, Value)>>,
 }
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -326,7 +327,7 @@ impl Relay {
             .filter(|v| v.get("type").and_then(Value::as_str) == Some("cmd"));
         match (cmd, &self.cmds) {
             (Some(v), Some(tx)) => {
-                if tx.try_send(v).is_err() {
+                if tx.try_send((Instant::now(), v)).is_err() {
                     log::debug!("relay: a command was dropped");
                 }
             }
@@ -720,7 +721,7 @@ mod tests {
         relay.cmds = Some(ctx);
         let task = tokio::spawn(relay.run());
         state.wait_for(|s| *s == RelayState::Connected).await.unwrap();
-        let cmd = timeout(Duration::from_secs(5), crx.recv()).await.unwrap().unwrap();
+        let (_, cmd) = timeout(Duration::from_secs(5), crx.recv()).await.unwrap().unwrap();
         assert_eq!(cmd["id"], "c1");
         assert!(crx.try_recv().is_err(), "only the cmd");
         // The session is still up and streams.

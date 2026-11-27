@@ -20,6 +20,17 @@ const RESULT_TIMEOUT: Duration = Duration::from_secs(3);
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Why a command got no result.
+#[derive(Debug, thiserror::Error)]
+pub enum CommandError {
+    #[error("timeout")]
+    Timeout,
+    #[error("connection closed")]
+    Closed,
+    #[error("send failed ({0})")]
+    Send(String),
+}
+
 /// GSX's answer to a command.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandResult {
@@ -133,11 +144,12 @@ impl GsxClient {
 
     /// Sends `verb` with `args` and waits for the `result` with the same id.
     /// Other messages in the meantime are kept for `next`.
-    pub async fn command(&mut self, verb: &str, args: Value) -> anyhow::Result<CommandResult> {
+    pub async fn command(&mut self, verb: &str, args: Value) -> Result<CommandResult, CommandError> {
         self.next_id += 1;
         let id = format!("sn.{}", self.next_id);
         self.send(&json!({"type":"command","id":id,"verb":verb,"args":args}))
-            .await?;
+            .await
+            .map_err(|e| CommandError::Send(e.to_string()))?;
         let limit = self.result_timeout;
         let wait = async {
             loop {
@@ -155,8 +167,8 @@ impl GsxClient {
         };
         let raw = match tokio::time::timeout(limit, wait).await {
             Ok(Some(v)) => v,
-            Ok(None) => anyhow::bail!("connection closed"),
-            Err(_) => anyhow::bail!("timeout"),
+            Ok(None) => return Err(CommandError::Closed),
+            Err(_) => return Err(CommandError::Timeout),
         };
         let err = raw.get("error");
         let text = |k: &str| err.and_then(|e| e.get(k)).and_then(Value::as_str).map(str::to_string);
@@ -303,7 +315,7 @@ mod tests {
         let (mut c, _) = GsxClient::connect(port).await.unwrap_or_else(|_| panic!("refused"));
         c.result_timeout = Duration::from_millis(200);
         let e = c.command("menu.close", json!({})).await.unwrap_err();
-        assert!(e.to_string().contains("timeout"));
+        assert!(matches!(e, CommandError::Timeout), "{e}");
     }
 
     #[tokio::test]

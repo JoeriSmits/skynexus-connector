@@ -33,7 +33,7 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, sleep_until, Instant};
+use tokio::time::{sleep_until, Instant};
 
 use super::block::{block, parkings, CmdResult, Emitter, GsxBlock, GsxParkings};
 use super::client::GsxClient;
@@ -53,6 +53,9 @@ const MAX_VERSION: usize = 24;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
 /// Commands queued for the read loop; it drains them even while busy.
 const READER_QUEUE: usize = 4;
+/// A gate or SimBrief command that waited longer than this since the relay
+/// delivered it is dropped, not run late.
+const MAX_CMD_AGE: Duration = Duration::from_secs(10);
 
 /// What the frame builder puts on the next frames: the block and GSX's
 /// gate list for its airport.
@@ -122,8 +125,8 @@ pub struct GsxRunnerCfg {
     /// Where the last posted health is kept; None keeps it in memory only.
     pub posted_file: Option<PathBuf>,
     pub timing: GsxTiming,
-    /// The relay's `cmd` messages, unparsed.
-    pub cmds: mpsc::Receiver<Value>,
+    /// The relay's `cmd` messages, unparsed, with the time each arrived.
+    pub cmds: mpsc::Receiver<(Instant, Value)>,
 }
 
 fn code_str(c: GsxCode) -> &'static str {
@@ -167,8 +170,8 @@ fn publish(out: &watch::Sender<Option<GsxFeed>>, v: Option<GsxFeed>) {
 
 /// What the runner hands the read loop.
 enum ToReader {
-    /// Run this on GSX.
-    Run(String, Cmd),
+    /// Run this on GSX; the relay delivered it at the `Instant`.
+    Run(String, Cmd, Instant),
     /// Put this result on the blocks (a `gsx.read` the runner handled).
     Show(CmdResult),
 }
@@ -252,10 +255,12 @@ async fn read_loop(
                 // The runner let go of this session.
                 None => break,
                 Some(ToReader::Show(r)) => last = Some(r),
-                Some(ToReader::Run(id, cmd)) => {
+                Some(ToReader::Run(id, cmd, at)) => {
                     // Only a gate on GSX's own list for its airport is selected.
                     let gates = parkings(&state).map(|p| p.names);
-                    if let Some(r) = check_gate(&id, &cmd, gates.as_deref()) {
+                    if at.elapsed() > MAX_CMD_AGE {
+                        log::info!("gsx: {} dropped; it waited {} s", cmd.verb(), at.elapsed().as_secs());
+                    } else if let Some(r) = check_gate(&id, &cmd, gates.as_deref()) {
                         last = Some(r);
                     } else {
                         let run = execute(&mut client, id, cmd);
@@ -266,7 +271,7 @@ async fn read_loop(
                                 c = cmds.recv() => {
                                     match c {
                                         None => break 'session,
-                                        Some(ToReader::Run(id, _)) => last = Some(refused(id, BUSY)),
+                                        Some(ToReader::Run(id, ..)) => last = Some(refused(id, BUSY)),
                                         Some(ToReader::Show(r)) => last = Some(r),
                                     }
                                     if has_state {
@@ -287,32 +292,46 @@ async fn read_loop(
     publish(&out, None);
 }
 
-/// One relay `cmd`. A `gsx.read` sets the read switch until the next
-/// ticket and returns true (the runner looks again at once). The others go
-/// to the read loop; without one they are not run (`not_reading`, which
-/// no block carries, so it is only logged).
+/// Hands the `gsx.read` result to the read loop; kept until there is one.
+fn deliver(pending: &mut Option<CmdResult>, reader: &Option<Reader>) {
+    if let Some(rd) = reader {
+        if let Some(r) = pending.take() {
+            let _ = rd.cmds.try_send(ToReader::Show(r));
+        }
+    }
+}
+
+/// One relay `cmd` that arrived at `at`. A `gsx.read` sets the read
+/// switch until the next ticket and returns true when that changed it (the
+/// runner looks again at once); its ok goes on the blocks as soon as GSX is
+/// read. The others go to the read loop; without one they are not run
+/// (`not_reading`, which no block carries, so it is only logged).
 fn on_cmd(
-    v: &Value,
+    (at, v): (Instant, Value),
     reader: &Option<Reader>,
     read_override: &mut Option<bool>,
     pending: &mut Option<CmdResult>,
 ) -> bool {
-    let Some((id, cmd)) = parse_cmd(v) else {
+    let Some((id, cmd)) = parse_cmd(&v) else {
         log::debug!("gsx: ignoring a command the Connector does not run");
         return false;
     };
     let verb = cmd.verb();
     if let Cmd::Read(on) = cmd {
-        log::info!("gsx: reading switched {} from SkyNexus", if on { "on" } else { "off" });
-        *read_override = Some(on);
         *pending = Some(CmdResult {
             id,
             ok: true,
             code: None,
         });
-        return true;
+        if *read_override != Some(on) {
+            log::info!("gsx: reading switched {} from SkyNexus", if on { "on" } else { "off" });
+            *read_override = Some(on);
+            return true;
+        }
+        deliver(pending, reader);
+        return false;
     }
-    match reader.as_ref().map(|r| r.cmds.try_send(ToReader::Run(id, cmd))) {
+    match reader.as_ref().map(|r| r.cmds.try_send(ToReader::Run(id, cmd, at))) {
         Some(Ok(())) => {}
         Some(Err(_)) => log::info!("gsx: {verb} dropped; the read loop is not taking commands"),
         None => log::info!("gsx: {verb} not run ({NOT_READING})"),
@@ -393,6 +412,8 @@ pub async fn run(mut cfg: GsxRunnerCfg, api: ApiClient, out: watch::Sender<Optio
     let mut msfs_since: Option<Instant> = None;
     let mut last_logged: Option<GsxPosted> = None;
     let mut redial = Redial::new(t.reconnect_after, t.reconnect_max);
+    // After a dropped socket: no probe (and no post) before this.
+    let mut redial_at: Option<Instant> = None;
     // `gsx.read` from SkyNexus; the next ticket clears it.
     let mut read_override: Option<bool> = None;
     // The `gsx.read` result, for the next block when GSX is read after it.
@@ -418,94 +439,99 @@ pub async fn run(mut cfg: GsxRunnerCfg, api: ApiClient, out: watch::Sender<Optio
             if !(gsx && gsx_read && tray) {
                 stop_reading(&mut reader, &out).await;
             }
-            let (code, version) = match &reader {
-                Some(r) => (GsxCode::Ok, r.version.clone()),
-                None => {
-                    let couatl = cfg.extras.borrow().couatl_started;
-                    let (code, version, client) = probe(&cfg.probe, couatl).await;
-                    if let Some((client, hello)) = client.filter(|_| gsx && gsx_read && tray) {
-                        let (tx, rx) = mpsc::channel(READER_QUEUE);
-                        let extras = cfg.extras.clone();
-                        let task = tokio::spawn(read_loop(client, hello, extras, out.clone(), rx));
-                        reader = Some(Reader {
-                            task,
-                            version: version.clone(),
-                            started: Instant::now(),
-                            cmds: tx,
-                        });
+            // Inside the redial wait nothing is probed or posted; the wait
+            // does not block, so tickets and switches are seen meanwhile.
+            let redialing = reader.is_none() && redial_at.is_some_and(|d| Instant::now() < d);
+            if !redialing {
+                let (code, version) = match &reader {
+                    Some(r) => (GsxCode::Ok, r.version.clone()),
+                    None => {
+                        let couatl = cfg.extras.borrow().couatl_started;
+                        let (code, version, client) = probe(&cfg.probe, couatl).await;
+                        if let Some((client, hello)) = client.filter(|_| gsx && gsx_read && tray) {
+                            let (tx, rx) = mpsc::channel(READER_QUEUE);
+                            let extras = cfg.extras.clone();
+                            let task = tokio::spawn(read_loop(client, hello, extras, out.clone(), rx));
+                            reader = Some(Reader {
+                                task,
+                                version: version.clone(),
+                                started: Instant::now(),
+                                cmds: tx,
+                            });
+                        }
+                        (code, version)
                     }
-                    (code, version)
+                };
+                let current = GsxPosted {
+                    credential: credential_fingerprint(credential),
+                    code,
+                    gsx_version: version,
+                    reading: reader.is_some(),
+                };
+                if last_logged.as_ref() != Some(&current) {
+                    let v = current.gsx_version.as_deref().unwrap_or("-");
+                    log::info!("gsx: {} {v}, reading {}", code_str(code), current.reading);
+                    last_logged = Some(current.clone());
                 }
-            };
-            let current = GsxPosted {
-                credential: credential_fingerprint(credential),
-                code,
-                gsx_version: version,
-                reading: reader.is_some(),
-            };
-            if last_logged.as_ref() != Some(&current) {
-                let v = current.gsx_version.as_deref().unwrap_or("-");
-                log::info!("gsx: {} {v}, reading {}", code_str(code), current.reading);
-                last_logged = Some(current.clone());
-            }
-            let now = Instant::now();
-            let settling = matches!(code, GsxCode::NotRunning | GsxCode::NoApi) && now.duration_since(since) < t.settle;
-            let held = refused.as_ref() == Some(credential)
-                || server_off
-                || settling
-                || invalid.as_ref() == Some(&current)
-                || hold_until.is_some_and(|h| now < h);
-            if !held && posted.as_ref() != Some(&current) {
-                let result = api.post_gsx(credential, &body(&current)).await;
-                if !matches!(
-                    result,
-                    Err(ApiError::Network(_) | ApiError::RateLimited { .. } | ApiError::Unavailable { .. })
-                ) {
-                    post_failing = false;
-                    hold_until = None;
-                }
-                match result {
-                    Ok(()) => {
-                        if let Some(f) = cfg.posted_file.as_deref() {
-                            if let Err(e) = save_gsx_posted(f, &current) {
-                                log::warn!("gsx: cannot keep the last health: {e}");
+                let now = Instant::now();
+                let settling =
+                    matches!(code, GsxCode::NotRunning | GsxCode::NoApi) && now.duration_since(since) < t.settle;
+                let held = refused.as_ref() == Some(credential)
+                    || server_off
+                    || settling
+                    || invalid.as_ref() == Some(&current)
+                    || hold_until.is_some_and(|h| now < h);
+                if !held && posted.as_ref() != Some(&current) {
+                    let result = api.post_gsx(credential, &body(&current)).await;
+                    if !matches!(
+                        result,
+                        Err(ApiError::Network(_) | ApiError::RateLimited { .. } | ApiError::Unavailable { .. })
+                    ) {
+                        post_failing = false;
+                        hold_until = None;
+                    }
+                    match result {
+                        Ok(()) => {
+                            if let Some(f) = cfg.posted_file.as_deref() {
+                                if let Err(e) = save_gsx_posted(f, &current) {
+                                    log::warn!("gsx: cannot keep the last health: {e}");
+                                }
                             }
+                            posted = Some(current);
                         }
-                        posted = Some(current);
-                    }
-                    Err(ApiError::Unauthorized) => {
-                        log::warn!("gsx: SkyNexus refused the credential; not sending until it changes");
-                        refused = Some(credential.clone());
-                    }
-                    Err(ApiError::InvalidBody { path }) => {
-                        log::warn!("gsx: SkyNexus refused the health at {path}; not resending it");
-                        invalid = Some(current);
-                    }
-                    Err(ApiError::Disabled) => {
-                        log::info!("gsx: switched off on SkyNexus; asking again on the next ticket");
-                        server_off = true;
-                        // Mark the current ticket as seen: only a newer one turns it back on.
-                        cfg.features.borrow_and_update();
-                    }
-                    Err(e) => {
-                        if !post_failing {
-                            log::info!("gsx: cannot post the health ({e}); retrying");
-                            post_failing = true;
+                        Err(ApiError::Unauthorized) => {
+                            log::warn!("gsx: SkyNexus refused the credential; not sending until it changes");
+                            refused = Some(credential.clone());
                         }
-                        hold_until = e.retry_after().map(|d| now + d.min(MAX_RETRY_AFTER));
+                        Err(ApiError::InvalidBody { path }) => {
+                            log::warn!("gsx: SkyNexus refused the health at {path}; not resending it");
+                            invalid = Some(current);
+                        }
+                        Err(ApiError::Disabled) => {
+                            log::info!("gsx: switched off on SkyNexus; asking again on the next ticket");
+                            server_off = true;
+                            // Mark the current ticket as seen: only a newer one turns it back on.
+                            cfg.features.borrow_and_update();
+                        }
+                        Err(e) => {
+                            if !post_failing {
+                                log::info!("gsx: cannot post the health ({e}); retrying");
+                                post_failing = true;
+                            }
+                            hold_until = e.retry_after().map(|d| now + d.min(MAX_RETRY_AFTER));
+                        }
                     }
                 }
             }
         } else {
             stop_reading(&mut reader, &out).await;
         }
-        if let (Some(r), Some(rd)) = (pending.take(), &reader) {
-            let _ = rd.cmds.try_send(ToReader::Show(r));
-        }
+        deliver(&mut pending, &reader);
         let next_detect = Instant::now() + t.detect_every;
         let wake = loop {
             tokio::select! {
                 _ = sleep_until(next_detect), if active.is_some() => break Wake::Other,
+                _ = sleep_until(redial_at.unwrap_or(next_detect)), if redial_at.is_some_and(|d| Instant::now() < d) => break Wake::Other,
                 _ = ended(&mut reader) => break Wake::ReaderEnded,
                 r = cfg.features.changed() => break if r.is_err() { Wake::Closed } else { Wake::Ticket },
                 r = cfg.credential.changed() => break if r.is_err() { Wake::Closed } else { Wake::Other },
@@ -513,7 +539,7 @@ pub async fn run(mut cfg: GsxRunnerCfg, api: ApiClient, out: watch::Sender<Optio
                 r = cfg.sim.changed() => break if r.is_err() { Wake::Closed } else { Wake::Other },
                 c = cfg.cmds.recv(), if cmds_open => match c {
                     None => cmds_open = false,
-                    Some(v) => if on_cmd(&v, &reader, &mut read_override, &mut pending) { break Wake::Other },
+                    Some(c) => if on_cmd(c, &reader, &mut read_override, &mut pending) { break Wake::Other },
                 },
             }
         };
@@ -531,7 +557,7 @@ pub async fn run(mut cfg: GsxRunnerCfg, api: ApiClient, out: watch::Sender<Optio
                 let ran = reader.as_ref().map_or(Duration::ZERO, |r| r.started.elapsed());
                 stop_reading(&mut reader, &out).await;
                 // A GSX that accepts and drops at once is not dialled every 2 s.
-                sleep(redial.after(ran, t.stable_after)).await;
+                redial_at = Some(Instant::now() + redial.after(ran, t.stable_after));
             }
             Wake::Other => {}
         }
@@ -717,14 +743,19 @@ mod tests {
         tray: watch::Sender<bool>,
         sim: watch::Sender<Option<SimKind>>,
         _extras: watch::Sender<SimExtras>,
-        cmds: mpsc::Sender<Value>,
+        cmds: mpsc::Sender<(Instant, Value)>,
         task: JoinHandle<()>,
     }
 
     impl H {
         async fn cmd(&self, id: &str, verb: &str, args: Value) {
+            self.cmd_at(Instant::now(), id, verb, args).await;
+        }
+
+        /// A command the relay received at `at`.
+        async fn cmd_at(&self, at: Instant, id: &str, verb: &str, args: Value) {
             let v = json!({"type":"cmd","id":id,"verb":verb,"args":args});
-            self.cmds.send(v).await.unwrap();
+            self.cmds.send((at, v)).await.unwrap();
         }
 
         /// Waits for a block whose `last` is `(id, ok, code)`.
@@ -1191,6 +1222,79 @@ mod tests {
         h.cmd("c2", "gsx.gate", json!({"gate":"d 8"})).await;
         h.last_is("c2", false, Some("unknown_gate")).await;
         assert!(sent(&g).is_empty(), "GSX was never asked");
+    }
+
+    #[tokio::test]
+    async fn a_command_older_than_10_s_is_dropped() {
+        let g = gsx_answering(0).await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let mut h = start(&a, opts(g.port));
+        h.out.wait_for(Option::is_some).await.unwrap();
+        let old = Instant::now().checked_sub(Duration::from_secs(11)).unwrap();
+        h.cmd_at(old, "c1", "gsx.gate", json!({"gate":"D 8"})).await;
+        h.cmd("c2", "gsx.simbrief", json!({})).await;
+        h.last_is("c2", true, None).await;
+        let got = sent(&g);
+        assert_eq!(got.len(), 1, "c1 never ran");
+        assert_eq!(got[0]["verb"], "command.run");
+    }
+
+    #[tokio::test]
+    async fn a_ticket_during_the_redial_wait_clears_the_read_override() {
+        // Probe 1 stays open; the reading session (2) drops at once.
+        let up = (vec![HELLO.into(), snapshot("D 7")], false);
+        let drops = (vec![HELLO.into(), snapshot("D 7")], true);
+        let g = fake_gsx(vec![up.clone(), drops, up]).await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let timing = GsxTiming {
+            reconnect_after: Duration::from_millis(400),
+            ..fast()
+        };
+        let o = Opts {
+            features: Some((true, false)),
+            timing,
+            ..opts(g.port)
+        };
+        let h = start(&a, o);
+        n_posts(&a, 1).await;
+        h.cmd("r1", "gsx.read", json!({"on":true})).await;
+        until("the session dropped", async || g.closed.load(Ordering::SeqCst) >= 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Inside the 400 ms wait: the ticket says GSX is not read.
+        h.features.send_replace(Some((true, false)));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(*h.out.borrow(), None, "the override outlived the ticket");
+        let last = posts(&a).await.last().cloned().unwrap();
+        assert_eq!(health(&last)["reading"], false);
+    }
+
+    #[tokio::test]
+    async fn the_same_gsx_read_twice_probes_once() {
+        let g = gsx_answering(0).await;
+        let a = app(ResponseTemplate::new(204)).await;
+        let timing = GsxTiming {
+            detect_every: Duration::from_secs(30),
+            ..fast()
+        };
+        let o = Opts {
+            features: Some((true, false)),
+            timing,
+            ..opts(g.port)
+        };
+        let mut h = start(&a, o);
+        n_posts(&a, 1).await;
+        h.tray.send_replace(false);
+        until("a probe for the tray", async || g.accepts.load(Ordering::SeqCst) >= 2).await;
+        quiet().await;
+        let before = g.accepts.load(Ordering::SeqCst);
+        h.cmd("r1", "gsx.read", json!({"on":true})).await;
+        until("a probe for r1", async || g.accepts.load(Ordering::SeqCst) > before).await;
+        h.cmd("r2", "gsx.read", json!({"on":true})).await;
+        quiet().await;
+        assert_eq!(g.accepts.load(Ordering::SeqCst), before + 1, "r2 changed nothing");
+        // Tray back on: reading, and r2's ok is the last result.
+        h.tray.send_replace(true);
+        h.last_is("r2", true, None).await;
     }
 
     #[tokio::test]

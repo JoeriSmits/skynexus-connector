@@ -4,19 +4,20 @@
 //!
 //! | SkyNexus verb  | Args            | GSX                                          |
 //! |----------------|-----------------|----------------------------------------------|
-//! | `gsx.gate`     | `{gate}` 1..24  | `gate.select {gate, force: true}`            |
+//! | `gsx.gate`     | `{gate}` 1..24  | `gate.select {gate, force: false}`           |
 //! | `gsx.simbrief` | none            | `command.run {command: "RELOAD_SIMBRIEF"}`   |
 //! | `gsx.read`     | `{on}`          | nothing: the runner flips the read switch    |
 //!
 //! The GSX args follow Any2GSX's client (`GsxApiClient.GateSelect` and
 //! `CommandRun`, which maps `GsxCommandRunType.ReloadSimbrief` (4) to
-//! `"RELOAD_SIMBRIEF"`). Anything else, `gsx.service` and `gsx.push`
+//! `"RELOAD_SIMBRIEF"`). `force` is false so a gate the pilot picked in
+//! GSX is not overridden. Anything else, `gsx.service` and `gsx.push`
 //! included, is ignored: SkyNexus does not call services or push back.
 
 use serde_json::{json, Value};
 
 use super::block::CmdResult;
-use super::client::GsxClient;
+use super::client::{CommandError, GsxClient};
 
 /// The command was not run: GSX is not being read (switched off, or not
 /// `GSX_OK`).
@@ -103,7 +104,7 @@ pub fn check_gate(id: &str, cmd: &Cmd, names: Option<&[String]>) -> Option<CmdRe
 /// The GSX verb and args for a command; None for `Read`, which GSX never sees.
 fn gsx_call(cmd: &Cmd) -> Option<(&'static str, Value)> {
     match cmd {
-        Cmd::Gate(gate) => Some(("gate.select", json!({ "gate": gate, "force": true }))),
+        Cmd::Gate(gate) => Some(("gate.select", json!({ "gate": gate, "force": false }))),
         Cmd::Simbrief => Some(("command.run", json!({ "command": "RELOAD_SIMBRIEF" }))),
         Cmd::Read(_) => None,
     }
@@ -134,10 +135,9 @@ pub async fn execute(client: &mut GsxClient, id: String, cmd: Cmd) -> CmdResult 
         }
         Err(e) => {
             log::info!("gsx: {} got no result ({e})", cmd.verb());
-            let code = if e.to_string().contains("timeout") {
-                TIMEOUT
-            } else {
-                NOT_READING
+            let code = match e {
+                CommandError::Timeout => TIMEOUT,
+                CommandError::Closed | CommandError::Send(_) => NOT_READING,
             };
             refused(id, code)
         }
@@ -261,7 +261,7 @@ mod tests {
         );
         let v = sent.await.unwrap();
         assert_eq!(v["verb"], "gate.select");
-        assert_eq!(v["args"], json!({"gate":"Gate 14","force":true}));
+        assert_eq!(v["args"], json!({"gate":"Gate 14","force":false}));
     }
 
     #[tokio::test]

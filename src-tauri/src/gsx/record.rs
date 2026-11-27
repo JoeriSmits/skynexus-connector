@@ -19,6 +19,12 @@ const SUMMARY_EVERY: u64 = 50;
 const SUBSCRIBE: &str = r#"{"type":"subscribe","id":"subscribe","channels":["state","prompts","toasts"]}"#;
 const STATE_GET: &str = r#"{"type":"command","id":"state.get.1","verb":"state.get","args":{}}"#;
 
+/// Progress for the founder's terminal (stdout) and the log file.
+fn say(msg: &str) {
+    println!("{msg}");
+    log::info!("gsx-record: {msg}");
+}
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -56,7 +62,7 @@ pub async fn record_until(path: &Path, url: &str, stop: impl Future<Output = ()>
         .append(true)
         .open(path)
         .with_context(|| format!("open {}", path.display()))?;
-    log::info!("gsx-record: writing {} from {url}, Ctrl+C to stop", path.display());
+    say(&format!("writing {} from {url}, Ctrl+C to stop", path.display()));
     tokio::pin!(stop);
     let mut announced = false;
     let mut total = 0u64;
@@ -68,16 +74,16 @@ pub async fn record_until(path: &Path, url: &str, stop: impl Future<Output = ()>
         match conn {
             Ok((ws, _)) => {
                 announced = false;
-                log::info!("gsx-record: connected to {url}");
+                say(&format!("connected to {url}"));
                 let done = session(ws, &mut file, &mut total, &mut stop).await;
                 if done {
                     break;
                 }
-                log::info!("gsx-record: connection closed, reconnecting");
+                say("connection closed, reconnecting");
             }
             Err(_) => {
                 if !announced {
-                    log::info!("gsx-record: GSX not reachable at {url}, retrying every 2 s");
+                    say(&format!("waiting for GSX at {url}, retrying every 2 s"));
                     announced = true;
                 }
             }
@@ -87,7 +93,7 @@ pub async fn record_until(path: &Path, url: &str, stop: impl Future<Output = ()>
             _ = tokio::time::sleep(RETRY) => {}
         }
     }
-    log::info!("gsx-record: stopped after {total} messages");
+    say(&format!("stopped after {total} messages"));
     Ok(())
 }
 
@@ -128,8 +134,7 @@ async fn session(
                 }
                 *total += 1;
                 if *total / SUMMARY_EVERY != (*total - 1) / SUMMARY_EVERY {
-                    log::info!("gsx-record: {total} messages (last: {})",
-                        msg_type(&text).unwrap_or_else(|| "?".into()));
+                    say(&format!("{total} messages (last: {})", msg_type(&text).unwrap_or_else(|| "?".into())));
                 }
                 if !subscribed && msg_type(&text).as_deref() == Some("hello") {
                     subscribed = true;

@@ -97,10 +97,29 @@ pub fn run() {
     run_tray(&rt, engine);
 }
 
+/// The release build is a GUI-subsystem process with no console of its own;
+/// attach to the one it was started from so stdout and Ctrl+C work.
+#[cfg(windows)]
+fn attach_parent_console() {
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    // ATTACH_PARENT_PROCESS = 0xFFFFFFFF. Failure (no parent console) is fine.
+    unsafe {
+        AttachConsole(0xFFFF_FFFF);
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
 /// `--gsx-record FILE`: headless capture of GSX's Remote API, no tray,
 /// pairing or relay. Stops on Ctrl+C.
 fn run_gsx_record(path: &std::path::Path) {
-    let port = gsx::port::remote_port(&gsx::port::ini_path());
+    attach_parent_console();
+    let ini = gsx::port::ini_path();
+    let port = gsx::port::remote_port(&ini);
+    println!("gsx-record: Remote API port {port} (from {})", ini.display());
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

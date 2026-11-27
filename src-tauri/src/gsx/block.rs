@@ -27,6 +27,10 @@ const CHANGE_EVERY: Duration = Duration::from_secs(1);
 const HEARTBEAT: Duration = Duration::from_millis(4500);
 /// The gate list is re-sent this often while GSX is read.
 const PARKINGS_EVERY: Duration = Duration::from_secs(60);
+/// After the block went away, `null` is repeated on the heartbeat this
+/// long (the relay's frame slot may replace a frame before it is sent),
+/// then the field is left off.
+const NULL_FOR: Duration = Duration::from_secs(15);
 
 /// The services the EFB knows. Anything else is dropped.
 const SERVICE_IDS: [&str; 12] = [
@@ -228,14 +232,25 @@ fn trim(b: &mut GsxBlock) {
     }
 }
 
-/// The gate names of GSX's airport, capped to what the EFB accepts. None
-/// when there is no valid airport or no gate.
+/// A gate name exactly as GSX has it, or None. Never cut or trimmed: the
+/// EFB sends the name back and only an exact match is selected.
+fn exact_name(s: &str) -> Option<String> {
+    let ok = !s.trim().is_empty()
+        && s.trim() == s
+        && s.encode_utf16().count() <= MAX_TEXT
+        && !s.chars().any(char::is_control);
+    ok.then(|| s.to_string())
+}
+
+/// The gate names of GSX's airport, capped to what the EFB accepts. A name
+/// over 24 UTF-16 units is left out, not cut. None when there is no valid
+/// airport or no gate.
 pub fn parkings(state: &GsxState) -> Option<GsxParkings> {
     let apt = state.airport().and_then(icao)?;
     let mut names: Vec<String> = state
         .parkings()
         .iter()
-        .filter_map(|n| clean(n, MAX_TEXT))
+        .filter_map(|n| exact_name(n))
         .take(PARKINGS_MAX_NAMES)
         .collect();
     let mut p = GsxParkings { apt, names: vec![] };
@@ -257,17 +272,34 @@ pub struct Emitter {
     sent: Option<GsxBlock>,
     sent_at: Option<Instant>,
     parkings: Option<(String, Instant)>,
+    /// When the block went away, and when `null` last went out.
+    gone: Option<(Instant, Instant)>,
 }
 
 impl Emitter {
     /// `None`: leave the field off this frame. `Some(Some(b))`: send the
-    /// block. `Some(None)`: send `null` (GSX went away), once.
+    /// block. `Some(None)`: send `null` (GSX went away): at once, then on
+    /// the heartbeat for 15 s, then nothing.
     pub fn on_frame(&mut self, now: Instant, current: Option<GsxBlock>) -> Option<Option<GsxBlock>> {
         let Some(cur) = current else {
             self.sent_at = None;
             self.parkings = None;
-            return self.sent.take().map(|_| None);
+            if self.sent.take().is_some() {
+                self.gone = Some((now, now));
+                return Some(None);
+            }
+            let (since, last) = self.gone?;
+            if now.saturating_duration_since(since) >= NULL_FOR {
+                self.gone = None;
+                return None;
+            }
+            if now.saturating_duration_since(last) < HEARTBEAT {
+                return None;
+            }
+            self.gone = Some((since, now));
+            return Some(None);
         };
+        self.gone = None;
         let age = self.sent_at.map(|t| now.saturating_duration_since(t));
         let due = match (&self.sent, age) {
             (None, _) | (_, None) => true,
@@ -494,6 +526,36 @@ mod tests {
     }
 
     #[test]
+    fn null_repeats_on_the_heartbeat_for_15_s_then_goes_absent() {
+        let (mut e, t0) = (Emitter::default(), Instant::now());
+        assert!(e.on_frame(t0, Some(blk("A1"))).is_some());
+        let mut nulls = vec![];
+        for i in 1..=50u64 {
+            let ms = i * 500;
+            let got = e.on_frame(t0 + Duration::from_millis(ms), None);
+            assert!(matches!(got, None | Some(None)), "{ms}");
+            if got.is_some() {
+                nulls.push(ms);
+            }
+        }
+        // Gone at 500 ms: null then, every 4.5 s, and nothing from 15.5 s.
+        assert_eq!(nulls, vec![500, 5000, 9500, 14000]);
+    }
+
+    #[test]
+    fn a_block_that_comes_back_stops_the_nulls() {
+        let (mut e, t0) = (Emitter::default(), Instant::now());
+        let at = |ms| t0 + Duration::from_millis(ms);
+        assert!(e.on_frame(at(0), Some(blk("A1"))).is_some());
+        assert_eq!(e.on_frame(at(500), None), Some(None));
+        assert_eq!(e.on_frame(at(1000), Some(blk("A1"))), Some(Some(blk("A1"))));
+        assert_eq!(e.on_frame(at(1500), Some(blk("A1"))), None);
+        assert_eq!(e.on_frame(at(2000), None), Some(None));
+        assert_eq!(e.on_frame(at(5000), None), None);
+        assert_eq!(e.on_frame(at(6500), None), Some(None), "4.5 s after the new gone");
+    }
+
+    #[test]
     fn parkings_go_out_on_change_and_every_60_s() {
         let (mut e, t0) = (Emitter::default(), Instant::now());
         let at = |s| t0 + Duration::from_secs(s);
@@ -510,10 +572,27 @@ mod tests {
         let names: Vec<String> = (0..600).map(|i| format!("Stand {i}")).collect();
         let p = parkings(&state_with(json!([]), names)).unwrap();
         assert_eq!(p.names.len(), PARKINGS_MAX_NAMES);
-        let long: Vec<String> = (0..400).map(|i| format!("{i:03}{}", "y".repeat(40))).collect();
+        // 400 names of 24 units are over 8 KB: some are dropped, none cut.
+        let long: Vec<String> = (0..400).map(|i| format!("{i:03}{}", "y".repeat(21))).collect();
         let p = parkings(&state_with(json!([]), long)).unwrap();
-        assert!(p.names.iter().all(|n| n.chars().count() <= 24));
+        assert!(p.names.len() < 400);
+        assert!(p.names.iter().all(|n| n.chars().count() == 24));
         assert!(serde_json::to_string(&p).unwrap().len() <= PARKINGS_MAX_BYTES);
+    }
+
+    #[test]
+    fn gate_names_over_24_units_are_dropped_not_cut() {
+        let plane = "\u{1F6EB}";
+        let names = vec![
+            "D 7".to_string(),
+            "x".repeat(24),
+            "x".repeat(25),
+            plane.repeat(12),
+            plane.repeat(13),
+            " D 8".to_string(),
+        ];
+        let p = parkings(&state_with(json!([]), names)).unwrap();
+        assert_eq!(p.names, vec!["D 7".to_string(), "x".repeat(24), plane.repeat(12)]);
     }
 
     fn frame() -> crate::frame::Frame {

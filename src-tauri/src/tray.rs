@@ -112,9 +112,21 @@ pub fn build(app: &App, engine: Arc<Engine>, msfs: Option<MsfsEntry>) -> tauri::
     let techlog_dir = handle.path().app_config_dir().ok();
     let techlog_on = techlog_dir.as_deref().is_some_and(techlog_setting::is_on);
     let read_techlog = CheckMenuItem::with_id(handle, "read_techlog", "Read TechLog", true, techlog_on, None::<&str>)?;
-    // On by default: only a saved "off" turns it off.
+    // On by default: only a saved "off" turns it off. Windows only, like
+    // "Start with MSFS": GSX runs with MSFS, which runs only there.
     let gsx_on = techlog_dir.as_deref().is_none_or(gsx_setting::is_on);
-    let read_gsx = CheckMenuItem::with_id(handle, "read_gsx", "Read GSX", true, gsx_on, None::<&str>)?;
+    let read_gsx = if cfg!(windows) {
+        Some(CheckMenuItem::with_id(
+            handle,
+            "read_gsx",
+            "Read GSX",
+            true,
+            gsx_on,
+            None::<&str>,
+        )?)
+    } else {
+        None
+    };
     let open_logs = MenuItem::with_id(handle, "logs", "Open logs", true, None::<&str>)?;
     let quit = MenuItem::with_id(handle, "quit", "Quit SkyNexus Connector", true, None::<&str>)?;
     let separator_top = PredefinedMenuItem::separator(handle)?;
@@ -130,10 +142,12 @@ pub fn build(app: &App, engine: Arc<Engine>, msfs: Option<MsfsEntry>) -> tauri::
     if let Some(item) = &with_msfs {
         entries.push(item);
     }
+    entries.push(&read_techlog);
+    if let Some(item) = &read_gsx {
+        entries.push(item);
+    }
     entries.extend([
-        &read_techlog as &dyn tauri::menu::IsMenuItem<Wry>,
-        &read_gsx,
-        &autostart,
+        &autostart as &dyn tauri::menu::IsMenuItem<Wry>,
         &open_logs,
         &separator_bottom,
         &quit,
@@ -216,7 +230,9 @@ pub fn build(app: &App, engine: Arc<Engine>, msfs: Option<MsfsEntry>) -> tauri::
                 // Without a saved choice the switch would not survive a restart: leave it as it was.
                 let now = if saved { on } else { !on };
                 on_menu.set_read_gsx(now);
-                let _ = read_gsx_item.set_checked(now);
+                if let Some(item) = &read_gsx_item {
+                    let _ = item.set_checked(now);
+                }
             }
             "logs" => match logs::log_dir() {
                 Some(dir) => {

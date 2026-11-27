@@ -22,8 +22,9 @@ const PAX_MAX: u32 = 1000;
 /// A changed block goes out at most this often.
 const CHANGE_EVERY: Duration = Duration::from_secs(1);
 /// An unchanged block still goes out this often, so a viewer that joins
-/// late (or a relay that restarted) catches up.
-const HEARTBEAT: Duration = Duration::from_secs(5);
+/// late (or a relay that restarted) catches up within 5 s. Under 5 s so the
+/// parked aircraft's 5 s frame heartbeat carries it every time.
+const HEARTBEAT: Duration = Duration::from_millis(4500);
 /// The gate list is re-sent this often while GSX is read.
 const PARKINGS_EVERY: Duration = Duration::from_secs(60);
 
@@ -118,13 +119,22 @@ pub mod double_option {
     }
 }
 
-/// Trimmed, at most `max` chars, and None for empty text or control chars.
+/// Trimmed, at most `max` UTF-16 code units (the EFB measures JavaScript
+/// string length), and None for empty text or control chars.
 fn clean(s: &str, max: usize) -> Option<String> {
     let t = s.trim();
     if t.is_empty() || t.chars().any(|c| c.is_control()) {
         return None;
     }
-    Some(t.chars().take(max).collect::<String>().trim_end().to_string()).filter(|s| !s.is_empty())
+    let mut units = 0;
+    let cut: String = t
+        .chars()
+        .take_while(|c| {
+            units += c.len_utf16();
+            units <= max
+        })
+        .collect();
+    Some(cut.trim_end().to_string()).filter(|s| !s.is_empty())
 }
 
 fn icao(s: &str) -> Option<String> {
@@ -424,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_block_goes_out_at_0_and_5_s_only() {
+    fn unchanged_block_goes_out_at_0_and_4_5_s_only() {
         let (mut e, t0) = (Emitter::default(), Instant::now());
         let b = blk("A1");
         let mut sent = vec![];
@@ -434,7 +444,29 @@ mod tests {
                 sent.push(i * 500);
             }
         }
-        assert_eq!(sent, vec![0, 5000]);
+        assert_eq!(sent, vec![0, 4500]);
+    }
+
+    #[test]
+    fn a_parked_5_s_heartbeat_carries_the_block_every_time() {
+        let (mut e, t0) = (Emitter::default(), Instant::now());
+        let b = blk("A1");
+        for i in 0..6u64 {
+            let now = t0 + Duration::from_secs(i * 5);
+            assert!(e.on_frame(now, Some(b.clone())).is_some(), "{i}");
+        }
+    }
+
+    #[test]
+    fn clean_counts_utf16_units_like_the_efb() {
+        // U+1F6EB is two UTF-16 code units.
+        let plane = "\u{1F6EB}";
+        let s = clean(&plane.repeat(30), 48).unwrap();
+        assert_eq!(s.encode_utf16().count(), 48);
+        assert_eq!(s.chars().count(), 24);
+        assert_eq!(clean(&format!("a{plane}"), 2).as_deref(), Some("a"));
+        assert_eq!(clean("abc", 2).as_deref(), Some("ab"));
+        assert_eq!(clean(plane, 1), None, "nothing fits");
     }
 
     #[test]

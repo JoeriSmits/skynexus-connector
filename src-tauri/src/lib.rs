@@ -4,7 +4,8 @@
 //! Layout: `frame` (wire schema), `api` (web app routes), `pairing`,
 //! `credentials`, `ticket`, `relay`, `sim` (adapters and pacing), `engine`
 //! (lifetimes), `tray` (UI), `config` (flags), `msfs_launch` (start and stop
-//! with MSFS), `logs` (the log file), `techlog` (the TechLog link).
+//! with MSFS), `logs` (the log file), `techlog` (the TechLog link), `gsx`
+//! (GSX Pro).
 
 pub mod api;
 pub mod config;
@@ -205,6 +206,10 @@ fn on_second_copy(app: &tauri::AppHandle, argv: &[String]) {
 }
 
 async fn run_headless(engine: Arc<Engine>) {
+    // Respect a "Read GSX" the tray turned off.
+    if let Some(dir) = config::app_config_dir() {
+        engine.set_read_gsx(gsx::setting::is_on(&dir));
+    }
     engine.start();
     tokio::spawn(log_status(engine.clone()));
     if !engine.config().offline && !engine.current().signed_in() {
@@ -250,6 +255,12 @@ fn run_tray(rt: &tokio::runtime::Runtime, engine: Arc<Engine>) {
                 .app_config_dir()
                 .is_ok_and(|dir| techlog::setting::is_on(&dir));
             setup_engine.set_read_techlog(techlog_on);
+            // "Read GSX" is on unless the user turned it off.
+            let gsx_on = app
+                .path()
+                .app_config_dir()
+                .map_or(true, |dir| gsx::setting::is_on(&dir));
+            setup_engine.set_read_gsx(gsx_on);
             tray::build(app, setup_engine.clone(), entry.zip(msfs_on))?;
             setup_engine.start();
             tauri::async_runtime::spawn(log_status(setup_engine.clone()));

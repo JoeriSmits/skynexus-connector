@@ -1,9 +1,68 @@
-//! Runtime configuration: the SkyNexus base URL, the relay URL and dev flags.
+//! Runtime configuration: the SkyNexus base URL, the relay URL and dev
+//! flags, plus the little state kept on disk (the last GSX health posted).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Parser;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::gsx::detect::GsxCode;
+use crate::logs::IDENTIFIER;
+
+/// The file in the app config folder that keeps the last GSX health posted.
+pub const GSX_POSTED_FILE: &str = "gsx-health.json";
+
+/// The GSX health SkyNexus last accepted, kept next to the credential it was
+/// posted with (by fingerprint, never the credential itself), so a restart
+/// without a change posts nothing and a new sign-in posts once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GsxPosted {
+    /// [`credential_fingerprint`] of the credential it was posted with.
+    pub credential: String,
+    pub code: GsxCode,
+    #[serde(default)]
+    pub gsx_version: Option<String>,
+    pub reading: bool,
+}
+
+/// The first 16 hex digits of the credential's SHA-256.
+pub fn credential_fingerprint(credential: &str) -> String {
+    hex::encode(Sha256::digest(credential.as_bytes()))[..16].to_string()
+}
+
+/// None when there is no file or it does not parse.
+pub fn load_gsx_posted(file: &Path) -> Option<GsxPosted> {
+    serde_json::from_str(&std::fs::read_to_string(file).ok()?).ok()
+}
+
+pub fn save_gsx_posted(file: &Path, p: &GsxPosted) -> std::io::Result<()> {
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = file.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(p)?)?;
+    std::fs::rename(tmp, file)
+}
+
+/// The folder Tauri's `app_config_dir` names, also for headless runs:
+/// `%APPDATA%`, `~/Library/Application Support` or `~/.config`, then the
+/// identifier.
+pub fn app_config_dir() -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        PathBuf::from(std::env::var_os("APPDATA")?)
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support")
+    } else {
+        match std::env::var_os("XDG_CONFIG_HOME") {
+            Some(x) => PathBuf::from(x),
+            None => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
+        }
+    };
+    Some(base.join(IDENTIFIER))
+}
 
 /// Production web app. Overridable with `--base-url` for dev.
 pub const DEFAULT_BASE_URL: &str = "https://app.skynexus.nl";
@@ -395,6 +454,39 @@ mod tests {
 
     fn relay_or_default() -> String {
         BUILD_RELAY_URL.unwrap_or(DEFAULT_RELAY_URL).to_string()
+    }
+
+    fn temp_file(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("snx-config-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d.join(GSX_POSTED_FILE)
+    }
+
+    #[test]
+    fn gsx_posted_round_trips_and_a_bad_file_is_none() {
+        use crate::gsx::detect::GsxCode;
+        let f = temp_file("posted");
+        assert_eq!(load_gsx_posted(&f), None, "no file yet");
+        let p = GsxPosted {
+            credential: credential_fingerprint("snc_1"),
+            code: GsxCode::Ok,
+            gsx_version: Some("4.0.8".into()),
+            reading: true,
+        };
+        save_gsx_posted(&f, &p).unwrap();
+        assert_eq!(load_gsx_posted(&f), Some(p));
+        std::fs::write(&f, "not json").unwrap();
+        assert_eq!(load_gsx_posted(&f), None);
+        let raw = std::fs::read_to_string(&f).unwrap();
+        assert!(!raw.contains("snc_1"));
+    }
+
+    #[test]
+    fn the_fingerprint_never_holds_the_credential() {
+        let a = credential_fingerprint("snc_secret");
+        assert_eq!(a.len(), 16);
+        assert!(!a.contains("secret"));
+        assert_ne!(a, credential_fingerprint("snc_other"));
     }
 
     #[test]

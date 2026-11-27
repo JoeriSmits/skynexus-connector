@@ -9,7 +9,8 @@
 //!   400 `{error}` with `authorization_pending`, `slow_down`, `access_denied`,
 //!   `expired_token` or `invalid_grant`; 429 `slow_down`; 5xx transient.
 //! - `POST /api/connector/ticket` with `Authorization: Bearer snc_...`
-//!   -> 200 `{ticket, role: "connector", expires_in: 900, expires_at: ISO, features?: {techlog, techlogRead}}`;
+//!   -> 200 `{ticket, role: "connector", expires_in: 900, expires_at: ISO,
+//!   features?: {techlog, techlogRead, gsx, gsxRead}}`;
 //!   401 `invalid_credential` | `revoked` (signed out); 403 `not_enabled`
 //!   (keep the credential, retry later); 429; 503.
 //! - `DELETE /api/connector/devices` with the bearer credential: sign-out
@@ -18,6 +19,10 @@
 //!   `{health, snapshot?}` or `{mode: "presence", health, present, simAircraft}` -> 204; 401 `invalid_credential` | `revoked`;
 //!   422 `{error: "invalid_body", path}`; 429; 503 `disabled` (kill switch)
 //!   or another 503 (transient).
+//! - `POST /api/connector/gsx` with the bearer credential and
+//!   `{health: {code, connectorVersion, schema: 1, gsxVersion?, reading}}` -> 204;
+//!   400 `{error: "invalid_body", path}`; 401; 429; 503 `disabled` (kill
+//!   switch) or another 503 (transient).
 
 use std::time::{Duration, Instant};
 
@@ -29,6 +34,7 @@ pub const PAIR_POLL_PATH: &str = "/api/connector/pair/poll";
 pub const TICKET_PATH: &str = "/api/connector/ticket";
 pub const DEVICES_PATH: &str = "/api/connector/devices";
 pub const TECHLOG_PATH: &str = "/api/connector/techlog";
+pub const GSX_PATH: &str = "/api/connector/gsx";
 
 /// RFC 8628 section 3.2: the default poll interval when the server sends none.
 pub const DEFAULT_POLL_INTERVAL_S: u64 = 5;
@@ -257,6 +263,20 @@ pub struct Ticket {
     pub clock_skew_s: Option<i64>,
     pub relay_url: Option<String>,
     pub features: Features,
+    /// `features.gsx`, the GSX kill switch. Missing or odd reads as true:
+    /// an older server never turns GSX off.
+    pub gsx: bool,
+    /// `features.gsxRead`, the pilot's "Read GSX" in the EFB. Missing or
+    /// odd reads as true.
+    pub gsx_read: bool,
+}
+
+/// A GSX flag in the ticket's `features`: only an explicit `false` is off.
+fn gsx_flag(features: Option<&serde_json::Value>, key: &str) -> bool {
+    features
+        .and_then(|f| f.get(key))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
 }
 
 /// The ticket's `features`. Lenient: a missing or odd value is false, so it
@@ -299,6 +319,8 @@ impl std::fmt::Debug for Ticket {
             .field("clock_skew_s", &self.clock_skew_s)
             .field("relay_url", &self.relay_url)
             .field("features", &self.features)
+            .field("gsx", &self.gsx)
+            .field("gsx_read", &self.gsx_read)
             .finish()
     }
 }
@@ -339,6 +361,8 @@ pub fn parse_ticket(body: &str, now_ms: u64, received: Instant) -> Result<Ticket
         clock_skew_s,
         relay_url: b.relay_url.filter(|u| !u.is_empty()),
         features: Features::parse(b.features.as_ref()),
+        gsx: gsx_flag(b.features.as_ref(), "gsx"),
+        gsx_read: gsx_flag(b.features.as_ref(), "gsxRead"),
     })
 }
 
@@ -547,6 +571,35 @@ impl ApiClient {
             503 if error_code(&text).as_deref() == Some("disabled") => Err(ApiError::Disabled),
             503 => Err(service_unavailable(&text, retry_after)),
             s => Err(ApiError::Protocol(format!("techlog answered HTTP {s}"))),
+        }
+    }
+
+    /// Sends one GSX health report.
+    pub async fn post_gsx(&self, credential: &str, body: &serde_json::Value) -> Result<(), ApiError> {
+        let res = self
+            .http
+            .post(self.url(GSX_PATH))
+            .bearer_auth(credential)
+            .header("X-Connector-Version", env!("CARGO_PKG_VERSION"))
+            .json(body)
+            .send()
+            .await?;
+        let status = res.status().as_u16();
+        let retry_after = retry_after_of(&res);
+        let text = res.text().await?;
+        match status {
+            200..=299 => Ok(()),
+            400 => Err(ApiError::InvalidBody {
+                path: serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|v| v.get("path")?.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "?".into()),
+            }),
+            401 => Err(ApiError::Unauthorized),
+            429 => Err(ApiError::RateLimited { retry_after }),
+            503 if error_code(&text).as_deref() == Some("disabled") => Err(ApiError::Disabled),
+            503 => Err(service_unavailable(&text, retry_after)),
+            s => Err(ApiError::Protocol(format!("gsx answered HTTP {s}"))),
         }
     }
 
@@ -794,6 +847,60 @@ mod tests {
             assert!(ok(&r), "case {i}: {r:?}");
             let sent = &s.received_requests().await.unwrap()[0];
             assert_eq!(serde_json::from_slice::<serde_json::Value>(&sent.body).unwrap(), body);
+        }
+    }
+
+    #[test]
+    fn ticket_gsx_features_default_to_true() {
+        let r = Instant::now();
+        let f = |body: &str| {
+            let t = parse_ticket(body, 0, r).unwrap();
+            (t.gsx, t.gsx_read)
+        };
+        assert_eq!(f(r#"{"ticket":"o"}"#), (true, true), "an old server");
+        assert_eq!(f(r#"{"ticket":"o","features":{"techlog":true}}"#), (true, true));
+        assert_eq!(f(r#"{"ticket":"o","features":{"gsx":"no"}}"#), (true, true));
+        assert_eq!(f(r#"{"ticket":"o","features":{"gsx":false}}"#), (false, true));
+        assert_eq!(f(r#"{"ticket":"o","features":{"gsxRead":false}}"#), (true, false));
+    }
+
+    #[tokio::test]
+    async fn post_gsx_answers() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        type Check = fn(&Result<(), ApiError>) -> bool;
+        let bad = serde_json::json!({ "error": "invalid_body", "path": "health.code" });
+        let off = serde_json::json!({ "error": "disabled" });
+        let down = serde_json::json!({ "error": "unavailable" });
+        let cases: Vec<(ResponseTemplate, Check)> = vec![
+            (ResponseTemplate::new(204), |r| r.is_ok()),
+            (
+                ResponseTemplate::new(400).set_body_json(bad),
+                |r| matches!(r, Err(ApiError::InvalidBody { path }) if path == "health.code"),
+            ),
+            (ResponseTemplate::new(401), |r| matches!(r, Err(ApiError::Unauthorized))),
+            (ResponseTemplate::new(429).insert_header("retry-after", "30"), |r| {
+                matches!(r, Err(ApiError::RateLimited { .. }))
+            }),
+            (ResponseTemplate::new(503).set_body_json(off), |r| {
+                matches!(r, Err(ApiError::Disabled))
+            }),
+            (ResponseTemplate::new(503).set_body_json(down), |r| {
+                matches!(r, Err(ApiError::Unavailable { .. }))
+            }),
+        ];
+        for (i, (resp, ok)) in cases.into_iter().enumerate() {
+            let s = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(GSX_PATH))
+                .and(header("authorization", "Bearer snc_1"))
+                .respond_with(resp)
+                .expect(1)
+                .mount(&s)
+                .await;
+            let body = serde_json::json!({ "health": { "code": "GSX_OK" } });
+            let r = ApiClient::new(&s.uri()).post_gsx("snc_1", &body).await;
+            assert!(ok(&r), "case {i}: {r:?}");
         }
     }
 

@@ -1,6 +1,6 @@
 //! The engine ties the parts together and owns their lifetimes: the sim
-//! driver thread, the pairing task, the relay task and the TechLog runner and presence check. The tray and the
-//! headless mode are both thin shells around it.
+//! driver thread, the pairing task, the relay task, the TechLog runner and presence check, and the GSX
+//! runner. The tray and the headless mode are both thin shells around it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,6 +12,8 @@ use crate::api::{ApiClient, Credential, Features};
 use crate::config::Config;
 use crate::credentials::CredentialStore;
 use crate::frame::{Frame, SimKind};
+use crate::gsx::block::Emitter;
+use crate::gsx::runner::{self as gsx_runner, GsxFeed, GsxProbe, GsxRunnerCfg, GsxTiming};
 use crate::pairing::{self, PairEvent, PollTiming};
 use crate::relay::{FrameSlot, Relay, RelayExit, RelayState, RelayTiming};
 use crate::sim::{self, SimState, Source};
@@ -106,6 +108,7 @@ struct Tasks {
     relay: Option<JoinHandle<()>>,
     techlog: Option<JoinHandle<()>>,
     presence: Option<JoinHandle<()>>,
+    gsx: Option<JoinHandle<()>>,
     sim: Option<std::thread::JoinHandle<()>>,
     /// Signals when the sign-out revoke finished, so Quit can wait for it.
     revoke_done: Option<std::sync::mpsc::Receiver<()>>,
@@ -142,6 +145,15 @@ pub struct Engine {
     aircraft: watch::Sender<Option<String>>,
     /// GSX L:vars from MSFS, every 5 s; all None without them.
     sim_extras: watch::Sender<sim::SimExtras>,
+    /// The connected sim while a flight is loaded; None otherwise.
+    sim_kind: watch::Sender<Option<SimKind>>,
+    /// `(features.gsx, features.gsxRead)` of every ticket; both true until a
+    /// ticket says otherwise.
+    gsx_features: watch::Sender<(bool, bool)>,
+    /// The "Read GSX" switch; on unless the tray turned it off.
+    read_gsx: watch::Sender<bool>,
+    /// What the GSX runner reads, for the own-ship frames.
+    gsx: watch::Sender<Option<GsxFeed>>,
 }
 
 impl Engine {
@@ -177,6 +189,10 @@ impl Engine {
             sim_on: watch::channel(false).0,
             aircraft: watch::channel(None).0,
             sim_extras: watch::channel(sim::SimExtras::default()).0,
+            sim_kind: watch::channel(None).0,
+            gsx_features: watch::channel((true, true)).0,
+            read_gsx: watch::channel(true).0,
+            gsx: watch::channel(None).0,
         })
     }
 
@@ -205,12 +221,22 @@ impl Engine {
         });
     }
 
-    /// The credential for the TechLog runner. Signing out also forgets the
-    /// last ticket's `features` (`techlog` and `techlogRead`), so another
-    /// account waits for its own.
+    /// Turns reading GSX on or off (the tray's "Read GSX").
+    pub fn set_read_gsx(&self, on: bool) {
+        self.read_gsx.send_if_modified(|cur| {
+            let changed = *cur != on;
+            *cur = on;
+            changed
+        });
+    }
+
+    /// The credential for the TechLog and GSX runners. Signing out also
+    /// forgets the last ticket's `features` (`techlog` and `techlogRead`;
+    /// `gsx` and `gsxRead` go back to on), so another account waits for its own.
     fn set_credential(&self, c: Option<&Credential>) {
         if c.is_none() {
             self.techlog_features.send_replace(Features::default());
+            self.gsx_features.send_replace((true, true));
         }
         self.credential_tx.send_replace(c.map(|c| c.credential.clone()));
     }
@@ -223,6 +249,10 @@ impl Engine {
             return;
         }
         self.start_techlog();
+        // GSX Pro exists only for MSFS on Windows: elsewhere it never probes.
+        if cfg!(windows) {
+            self.start_gsx(GsxProbe::system());
+        }
         match self.store.load() {
             Ok(Some(c)) => {
                 self.set_auth(Auth::SignedIn);
@@ -262,6 +292,10 @@ impl Engine {
         let sim_on = self.sim_on.clone();
         let aircraft = self.aircraft.clone();
         let sim_extras = self.sim_extras.clone();
+        let sim_kind = self.sim_kind.clone();
+        let gsx = self.gsx.subscribe();
+        let relay = self.relay_state.subscribe();
+        let mut gsx_emitter = Emitter::default();
         let handle = std::thread::Builder::new()
             .name("sim-driver".into())
             .spawn(move || {
@@ -270,7 +304,17 @@ impl Engine {
                     interval,
                     &stop,
                     |f: &Frame, hz: u32| {
-                        let json = f.to_json_with_tl(tl.borrow().as_deref());
+                        let tl = tl.borrow().clone();
+                        // Only frames that reach the relay spend the GSX emitter: one built while
+                        // the relay is down may be replaced in the slot before it is sent.
+                        let sending = !offline && *relay.borrow() == RelayState::Connected;
+                        let json = if !sending {
+                            f.to_json_with_tl(tl.as_deref())
+                        } else {
+                            let feed = gsx.borrow().clone();
+                            let now = std::time::Instant::now();
+                            gsx_runner::frame_json(f, tl.as_deref(), &mut gsx_emitter, feed.as_ref(), now)
+                        };
                         if print {
                             println!("{json}");
                         }
@@ -291,6 +335,11 @@ impl Engine {
                         if !connected {
                             frames.send_replace(None);
                         }
+                        let kind = match &s {
+                            SimState::Connected { kind, .. } => Some(*kind),
+                            _ => None,
+                        };
+                        sim_kind.send_if_modified(|cur| std::mem::replace(cur, kind) != kind);
                         sim_on.send_if_modified(|cur| std::mem::replace(cur, connected) != connected);
                         status.send_modify(|st| st.sim = s)
                     },
@@ -361,13 +410,39 @@ impl Engine {
         }
     }
 
+    /// Starts the GSX runner: detection while MSFS is connected and signed
+    /// in, reading while the ticket and the tray allow it.
+    fn start_gsx(self: &Arc<Self>, probe: GsxProbe) {
+        let posted_file = if self.cfg.ephemeral || self.cfg.offline {
+            None
+        } else {
+            crate::config::app_config_dir().map(|d| d.join(crate::config::GSX_POSTED_FILE))
+        };
+        let cfg = GsxRunnerCfg {
+            credential: self.credential_tx.subscribe(),
+            features: self.gsx_features.subscribe(),
+            tray: self.read_gsx.subscribe(),
+            sim: self.sim_kind.subscribe(),
+            extras: self.sim_extras.subscribe(),
+            probe,
+            posted_file,
+            timing: GsxTiming::default(),
+        };
+        let task = self.rt.spawn(gsx_runner::run(cfg, self.api.clone(), self.gsx.clone()));
+        if let Some(old) = self.tasks.lock().unwrap().gsx.replace(task) {
+            old.abort();
+        }
+    }
+
     fn start_relay(self: &Arc<Self>, c: Credential) {
         *self.credential.lock().unwrap() = Some(c.clone());
         self.set_credential(Some(&c));
         let me = self.clone();
         let relay = Relay {
             cfg: self.cfg.clone(),
-            tickets: TicketManager::new(self.api.clone(), c.credential).with_features(self.techlog_features.clone()),
+            tickets: TicketManager::new(self.api.clone(), c.credential)
+                .with_features(self.techlog_features.clone())
+                .with_gsx_features(self.gsx_features.clone()),
             frames: self.frames.subscribe(),
             state: self.relay_state.clone(),
             timing: RelayTiming::default(),
@@ -493,9 +568,15 @@ impl Engine {
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Relaxed);
         let mut t = self.tasks.lock().unwrap();
-        for task in [t.pairing.take(), t.relay.take(), t.techlog.take(), t.presence.take()]
-            .into_iter()
-            .flatten()
+        for task in [
+            t.pairing.take(),
+            t.relay.take(),
+            t.techlog.take(),
+            t.presence.take(),
+            t.gsx.take(),
+        ]
+        .into_iter()
+        .flatten()
         {
             task.abort();
         }
@@ -724,11 +805,13 @@ mod tests {
             techlog_read: true,
         };
         engine.techlog_features.send_replace(both);
+        engine.gsx_features.send_replace((false, false));
         engine.sign_out();
         assert!(
             *engine.techlog_features.borrow() == Features::default(),
             "a new account waits for its own ticket"
         );
+        assert_eq!(*engine.gsx_features.borrow(), (true, true), "GSX back to its default");
         assert_eq!(*engine.credential_tx.borrow(), None);
         let started = std::time::Instant::now();
         engine.shutdown();
@@ -740,6 +823,71 @@ mod tests {
         assert!(waited < REVOKE_WAIT_ON_QUIT + std::time::Duration::from_secs(1));
         let calls = rt.block_on(server.received_requests()).unwrap();
         assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn the_gsx_runner_reads_while_signed_in_in_msfs() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (server, port) = rt.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/connector/gsx"))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&server)
+                .await;
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let (s, _) = l.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(s).await.unwrap();
+                let hello = r#"{"type":"hello","protocol":2,"engine":"4.0.8"}"#;
+                let snap = r#"{"type":"snapshot","state":{"airport":{"icao":"EHAM"}}}"#;
+                ws.send(Message::text(hello)).await.unwrap();
+                ws.send(Message::text(snap)).await.unwrap();
+                while let Some(Ok(_)) = ws.next().await {}
+            });
+            (server, port)
+        });
+        let cfg = Config::from_cli(<crate::config::Cli as clap::Parser>::parse_from([
+            "x",
+            "--ephemeral",
+            "--base-url",
+            &server.uri(),
+        ]));
+        let store = Arc::new(crate::credentials::MemoryStore::default());
+        let engine = Engine::new(cfg, store, rt.handle().clone());
+        let probe = GsxProbe {
+            installed: Arc::new(|| true),
+            port: Arc::new(move || port),
+        };
+        engine.start_gsx(probe);
+        let mut gsx = engine.gsx.subscribe();
+        let secs = std::time::Duration::from_secs;
+        engine.credential_tx.send_replace(Some("snc_1".into()));
+        engine.sim_kind.send_replace(Some(SimKind::Msfs));
+        rt.block_on(async {
+            let up = tokio::time::timeout(secs(5), gsx.wait_for(Option::is_some));
+            let feed = up.await.unwrap().unwrap().clone().unwrap();
+            assert_eq!(feed.block.apt.as_deref(), Some("EHAM"));
+        });
+        engine.sign_out();
+        rt.block_on(async {
+            let down = tokio::time::timeout(secs(5), gsx.wait_for(Option::is_none));
+            down.await.unwrap().unwrap();
+        });
+        let calls = rt.block_on(server.received_requests()).unwrap();
+        let gsx_posts: Vec<_> = calls.iter().filter(|r| r.url.path() == "/api/connector/gsx").collect();
+        assert_eq!(gsx_posts.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&gsx_posts[0].body).unwrap();
+        assert_eq!(body["health"]["code"], "GSX_OK");
+        engine.shutdown();
     }
 
     #[test]

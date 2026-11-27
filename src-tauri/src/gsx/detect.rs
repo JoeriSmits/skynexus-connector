@@ -9,12 +9,16 @@ use serde::{Deserialize, Serialize};
 pub const MIN_PROTOCOL: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum GsxCode {
+    #[serde(rename = "GSX_NOT_INSTALLED")]
     NotInstalled,
+    #[serde(rename = "GSX_NOT_RUNNING")]
     NotRunning,
+    #[serde(rename = "GSX_NO_API")]
     NoApi,
+    #[serde(rename = "GSX_AUTH")]
     Auth,
+    #[serde(rename = "GSX_OK")]
     Ok,
 }
 
@@ -71,7 +75,7 @@ pub fn registry_root() -> Option<String> {
     use std::ffi::c_void;
 
     const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as i32 as isize;
-    const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+    const RRF_RT: u32 = 0x0000_0002 | 0x0000_0004 | 0x1000_0000; // SZ | EXPAND_SZ | NOEXPAND
     #[link(name = "advapi32")]
     extern "system" {
         fn RegGetValueW(
@@ -93,7 +97,7 @@ pub fn registry_root() -> Option<String> {
             HKEY_CURRENT_USER,
             sub.as_ptr(),
             val.as_ptr(),
-            RRF_RT_REG_SZ,
+            RRF_RT,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             &mut bytes,
@@ -109,7 +113,7 @@ pub fn registry_root() -> Option<String> {
             HKEY_CURRENT_USER,
             sub.as_ptr(),
             val.as_ptr(),
-            RRF_RT_REG_SZ,
+            RRF_RT,
             std::ptr::null_mut(),
             buf.as_mut_ptr().cast(),
             &mut bytes,
@@ -198,11 +202,20 @@ mod tests {
     }
 
     #[test]
-    fn codes_serialize_as_snake_case() {
-        let s = serde_json::to_string(&GsxCode::NotInstalled).unwrap();
-        assert_eq!(s, "\"not_installed\"");
-        let s = serde_json::to_string(&GsxCode::NoApi).unwrap();
-        assert_eq!(s, "\"no_api\"");
+    fn codes_serialize_as_the_wire_strings() {
+        use GsxCode::*;
+        let all = [
+            (NotInstalled, "GSX_NOT_INSTALLED"),
+            (NotRunning, "GSX_NOT_RUNNING"),
+            (NoApi, "GSX_NO_API"),
+            (Auth, "GSX_AUTH"),
+            (Ok, "GSX_OK"),
+        ];
+        for (code, wire) in all {
+            let s = serde_json::to_string(&code).unwrap();
+            assert_eq!(s, format!("\"{wire}\""));
+            assert_eq!(serde_json::from_str::<GsxCode>(&s).unwrap(), code);
+        }
     }
 
     #[test]

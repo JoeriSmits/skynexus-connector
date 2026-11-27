@@ -93,8 +93,9 @@ pub struct MsfsSim {
     title: Option<String>,
     /// GSX L:vars; all None until read, or if the definition was refused.
     extras: SimExtras,
-    /// False when the GSX definition failed; nothing is requested then.
-    gsx_ok: bool,
+    /// True once the GSX definition was added (only ever done once, as
+    /// AddToDataDefinition appends); nothing is requested without it.
+    gsx_defined: bool,
     /// The last "Sim" system state: None until MSFS first answers.
     in_flight: Option<bool>,
     next_traffic_request: Instant,
@@ -215,7 +216,7 @@ impl MsfsSim {
             own: None,
             title: None,
             extras: SimExtras::default(),
-            gsx_ok: false,
+            gsx_defined: false,
             in_flight: None,
             next_traffic_request: Instant::now(),
             last_answer: Instant::now(),
@@ -227,16 +228,22 @@ impl MsfsSim {
         sim.define(DEF_TITLE, &TITLE_DATUMS)?;
         sim.request_own()?;
         sim.request_title()?;
-        sim.start_gsx();
+        sim.gsx_defined = match sim.define(DEF_GSX, &GSX_DATUMS) {
+            Ok(()) => true,
+            Err(e) => {
+                log::debug!("msfs: GSX L:vars unavailable ({e})");
+                false
+            }
+        };
+        sim.request_gsx();
         Ok(sim)
     }
 
-    /// Defines and requests the GSX L:vars every 5 s. Any failure only
-    /// disables them (extras stay None); own-ship reading is unaffected.
-    fn start_gsx(&mut self) {
-        self.gsx_ok = false;
-        if let Err(e) = self.define(DEF_GSX, &GSX_DATUMS) {
-            log::debug!("msfs: GSX L:vars unavailable ({e})");
+    /// Requests the GSX L:vars every 5 s (the definition is made once, in
+    /// `open`). Any failure only leaves the extras None; own-ship reading is
+    /// unaffected.
+    fn request_gsx(&mut self) {
+        if !self.gsx_defined {
             return;
         }
         // SAFETY: open handle, our own definition and request ids. The
@@ -258,7 +265,6 @@ impl MsfsSim {
             log::debug!("msfs: GSX L:var request failed ({hr:#x})");
             return;
         }
-        self.gsx_ok = true;
     }
 
     /// (Re)starts the title request: once per second, answered only when the
@@ -390,6 +396,9 @@ impl Sim for MsfsSim {
     }
 
     fn extras(&self) -> SimExtras {
+        if !self.flying() {
+            return SimExtras::default();
+        }
         self.extras.clone()
     }
 
@@ -428,7 +437,7 @@ impl Sim for MsfsSim {
                         if od.request_id == REQ_TITLE {
                             self.title = decode_title(od.data);
                         }
-                        if od.request_id == REQ_GSX && self.gsx_ok {
+                        if od.request_id == REQ_GSX && self.gsx_defined {
                             self.extras = match decode_gsx(od.data) {
                                 Some((started, board, total)) => SimExtras {
                                     couatl_started: Some(started),
@@ -466,7 +475,7 @@ impl Sim for MsfsSim {
                                 // Back from the menus: ask for the new user aircraft.
                                 self.request_own().map_err(SimError::Other)?;
                                 self.request_title().map_err(SimError::Other)?;
-                                self.start_gsx();
+                                self.request_gsx();
                             }
                             if !flying {
                                 // The next flight starts at the air rate.
